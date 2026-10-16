@@ -1,0 +1,203 @@
+// constants.csl - 2.5D FMM constants
+//
+// Split into two clearly separated blocks:
+//
+//   [A] ALGEBRAIC / GEOMETRIC constants. Foundational, geometry-independent or
+//       derived from the table generator. Fixed now. These are reused from the
+//       3D implementation or recomputed; none depend on the communication
+//       design.
+//
+//   [B] COMMUNICATION constants (header layout, colors, queues, routing buffer
+//       sizes, agenda bounds). DELIBERATELY DEFERRED. In 2.5D every one of
+//       these changes relative to 3D, and the change depends on routing
+//       decisions not yet made (dimension-order XY, 4 queues E/W/N/S, Z
+//       aggregation into one message). Writing them now would mean guessing.
+//       This block is a declared placeholder with TODOs, filled in phase (d).
+//
+// The barrier between [A] and [B] is intentional: everything above it is
+// decided; everything below it is open.
+
+
+// ===========================================================================
+// IMPORTED PARAMETERS (from layout)
+// ===========================================================================
+param cells_per_side : u16;   // C: domain side in leaf cells = PE mesh side
+param prob_range : f32;       // physical edge length of the cubic domain
+param max_bodies_pe : u16;    // max bodies in one leaf cell's body buffer
+param cell_size : f32;        // leaf-cell edge = prob_range / C
+
+
+// ===========================================================================
+// [A] ALGEBRAIC / GEOMETRIC CONSTANTS  (fixed)
+// ===========================================================================
+
+// --- Tree geometry ---
+// C == 2**TREE_H. For C = 16, TREE_H = 4: four levels above the leaves.
+const TREE_H : u16 = 4;
+
+// Box edge length at each tree level. Index l gives the edge of a level-l box.
+// Level 0 = root (whole domain), level TREE_H = leaf cell.
+const box_size_at_level = [5]f32{
+    prob_range,              // level 0 (root)
+    prob_range / 2.0,        // level 1
+    prob_range / 4.0,        // level 2
+    prob_range / 8.0,        // level 3
+    prob_range / 16.0,       // level 4 (leaf, == cell_size for C=16)
+};
+
+// --- Multipole / expansion constants ---
+const P : u16 = 4;
+const N_COEFFS : u16 = (P + 1) * (P + 2) / 2;          // 15
+const C_BUF_SIZE : u16 = N_COEFFS * 2;                 // 30 (interleaved re/im)
+const N_COEFFS_V : u16 = (2*P + 1) * (2*P + 2) / 2;    // 45
+const C_BUF_M2L_SIZE : u16 = N_COEFFS_V * 2;           // 90
+
+// --- Operator table sizes ---
+// DERIVED FROM THE GENERATOR (verified for P=4). The generated data blob and
+// kernels.csl must agree with the generator by construction. Do NOT hand-edit.
+//   M2M = L2L = 92 entries, M2L = 375 entries.
+const M2M_N_ENTRIES : u16 = 92;
+const M2L_N_ENTRIES : u16 = 375;
+const L2L_N_ENTRIES : u16 = 92;
+
+// Number of CSR-style buckets in the operator tables: one per target coeff,
+// plus the trailing offset. offsets[-1] == N_ENTRIES for each table.
+const N_BUCKETS : u16 = N_COEFFS + 1;                  // 16
+
+// --- Body buffer layout ---
+// bodies[0] = reserved (3D used it for the Morton id; in 2.5D the PE already
+//             knows its (pe_x,pe_y) from the layout, so this slot's meaning is
+//             revisited when pe.csl is written).
+// bodies[1] = body count for this cell.
+// bodies[2..] = bodies, 4 floats each (x, y, z, q).
+// NOTE: in 2.5D a PE hosts a COLUMN of C leaf cells, so the per-PE body storage
+// is C times this. The exact column body layout is decided in phase (b), not
+// here; b_buf_len below is the single-cell length, kept for reference.
+const b_buf_len : u16 = 2 + max_bodies_pe * 4;
+
+// --- P2P payload ---
+const MAX_P2P_NEIGHBORS : u16 = 26;                    // 26 3D neighbours total
+const P2P_PAYLOAD_SIZE : u16 = 4 * max_bodies_pe;      // x,y,z,q per body
+
+
+// ===========================================================================
+// [B] COMMUNICATION CONSTANTS  (phase d - routing; now fixed)
+// ===========================================================================
+//
+// Routing is XY dimension-order (Dally & Seitz): a message travels along X to
+// the target column, then along Y. Never Y->X. The channel dependency graph is
+// acyclic by construction (verified), so with non-blocking receive and
+// drain-before-send priority the router is deadlock-free by construction.
+
+// --- Message types (2 bits) ---
+const MSG_M2M : u16 = 0;
+const MSG_M2L : u16 = 1;
+const MSG_L2L : u16 = 2;
+const MSG_P2P : u16 = 3;
+
+// --- Message granularity: K cubes per message ---------------------------
+// A plane message carries K source-cube expansions (Z-cubes of the source
+// column bound for one destination plane column). Levels with more than K cubes
+// along Z split into ceil(nz/K) messages; levels with nz<=K send in one.
+//   leaf (nz=16): 4 messages   level3 (nz=8): 2   level2 (nz=4): 1   ...
+// K=4 keeps messages small (fast buffer turnover, fine-grained flow control)
+// while fitting comfortably in memory (~23 KB free for code at C=16).
+const K_CUBES : u16 = 4;
+
+// --- Header layout (32 bits) --------------------------------------------
+// Target is a plane PE in [0,15]: 4 bits per axis. zcount = number of cube
+// expansions actually in THIS message (<= K_CUBES); the receiver also knows the
+// expected length from its own phase/level, but zcount lets a transit node
+// forward a message of any phase correctly.
+//
+//   bits 31..28 : target_x (4)
+//   bits 27..24 : target_y (4)
+//   bits 23..22 : msg_type (2)
+//   bits 21..20 : level - 2 (2)    -> level in [2,4] as [0,2]
+//   bits 19..11 : tag (9)          -> relative (dx,dy,dz) base-7 in [0,342]
+//   bits 10..8  : zcount (3)       -> cubes in this message (1..K_CUBES, K<=4)
+//   bits  7..4  : z_base (4)       -> first source-cube Z index in this message
+//   bits  3..0  : reserved (4)
+const SHIFT_TGT_X   : u16 = 28;
+const SHIFT_TGT_Y   : u16 = 24;
+const SHIFT_MSG_TYPE: u16 = 22;
+const SHIFT_LEVEL   : u16 = 20;
+const SHIFT_TAG     : u16 = 11;
+const SHIFT_ZCOUNT  : u16 = 8;
+const SHIFT_ZBASE   : u16 = 4;
+
+const MASK_4BIT : u32 = 0xF;
+const MASK_3BIT : u32 = 0x7;
+const MASK_2BIT : u32 = 0x3;
+const MASK_9BIT : u32 = 0x1FF;
+
+// --- Message sizes ------------------------------------------------------
+// Plane message payload = K_CUBES expansions; total = payload + 1 header.
+const MSG_PAYLOAD_MAX : u16 = K_CUBES * C_BUF_SIZE;    // 4 * 30 = 120 floats
+const MSG_SIZE : u16 = MSG_PAYLOAD_MAX + 1;            // 121 wavelets
+const P2P_MSG_SIZE : u16 = P2P_PAYLOAD_SIZE + 1;
+
+// --- Routing colors (8 = 4 directions x 2 parity) -----------------------
+// The even/odd parity split is a FABRIC requirement: adjacent PEs must use
+// different colors for the same logical direction so a color does not overlap
+// itself on consecutive hops. The one network mechanic reused from 3D.
+param color_e_even : color;
+param color_e_odd  : color;
+param color_w_even : color;
+param color_w_odd  : color;
+param color_n_even : color;
+param color_n_odd  : color;
+param color_s_even : color;
+param color_s_odd  : color;
+
+// --- Input / output queues (one per direction) + 2 host -----------------
+// One queue per receive side because a PE can receive from several sides at
+// once. E/W carry X-phase traffic, N/S carry Y-phase traffic: this split keeps
+// the channel graph acyclic.
+const e_iq = @get_input_queue(2);
+const w_iq = @get_input_queue(3);
+const n_iq = @get_input_queue(4);
+const s_iq = @get_input_queue(5);
+
+const e_oq = @get_output_queue(2);
+const w_oq = @get_output_queue(3);
+const n_oq = @get_output_queue(4);
+const s_oq = @get_output_queue(5);
+
+// --- Buffer depth: 2 tx + 2 rx per direction (UNIFIED, no separate FWD) --
+// Each direction has NBUF tx buffers (shared by originations and forwards) and
+// NBUF rx buffers. A forward claims a free tx buffer like an origination; if
+// none is free it waits in the rx buffer it arrived in. Under XY acyclic
+// routing a downstream PE always drains, so a tx buffer always eventually frees
+// -> the rx buffer frees -> no permanent block. This removes the 3D FWD FIFO.
+const NBUF : u16 = 2;
+
+// --- Agenda bound -------------------------------------------------------
+// Per-PE M2L agenda: <=48 distinct remote (X,Y) destinations; with K-splitting
+// the leaf level issues up to 4 messages per destination. Bound generously.
+const MAX_AGENDA : u16 = 256;
+
+// --- P2P neighbours ------------------------------------------------------
+// On the plane the 24 planar 3D-neighbours reduce to the 8 adjacent plane PEs
+// at 1 hop; the 2 Z-only neighbours are local.
+const MAX_P2P_PLANE : u16 = 8;
+
+
+// ===========================================================================
+// [B'] TASK IDs  (tied to the queue/color scheme)
+// ===========================================================================
+// Receive model: NO data tasks. Receive is an explicit async @mov32 drain that
+// activates a completion LOCAL task per direction. One tx-completion local task
+// per direction fires when an async send finishes (frees a tx buffer).
+const rx_complete_e_id : local_task_id = @get_local_task_id(18);
+const rx_complete_w_id : local_task_id = @get_local_task_id(19);
+const rx_complete_n_id : local_task_id = @get_local_task_id(20);
+const rx_complete_s_id : local_task_id = @get_local_task_id(21);
+
+const tx_complete_e_id : local_task_id = @get_local_task_id(22);
+const tx_complete_w_id : local_task_id = @get_local_task_id(23);
+const tx_complete_n_id : local_task_id = @get_local_task_id(24);
+const tx_complete_s_id : local_task_id = @get_local_task_id(25);
+
+// Sender driver: originates this PE's own M2L messages into tx-buffer slack.
+const m2l_send_task_id : local_task_id = @get_local_task_id(14);

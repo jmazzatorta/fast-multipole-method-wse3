@@ -1,0 +1,1622 @@
+// pe.csl - 2.5D FMM, PER-PE PROGRAM
+//
+// PHASE (b): P2M + local column state. ZERO COMMUNICATION.
+//
+// This first version lays down the resident column-state buffers and computes
+// P2M for every leaf cell in the PE's column. The communication layer (M2M/L2L
+// plane exchange, M2L router, P2P) is NOT here yet; it is built in phases (c),
+// (d), (e). Upper-level expansion buffers are declared but filled later.
+//
+// Mapping recap (2.5D):
+//   - PE(pe_x, pe_y) owns a COLUMN of C leaf cells stacked along Z.
+//   - (pe_x, pe_y) is fixed for the whole column; z = 0..C-1 is the local index.
+//   - A leaf cell is the single 1x1x1 cube at (pe_x, pe_y, z): multipoles are
+//     fully 3D, one per cube. The PE runs P2M C times, once per cube.
+//
+// Column resident state (separate buffers per level, each an array along Z;
+// persistent for the whole algorithm because M2L re-reads every level after the
+// upward pass). Nodes along Z at level l = 2**l:
+//   level 4 (leaf): C   nodes   -> m_lvl4 / l_lvl4
+//   level 3       : C/2 nodes   -> m_lvl3 / l_lvl3
+//   level 2       : C/4 nodes   -> m_lvl2 / l_lvl2
+//   level 1       : C/8 nodes   -> m_lvl1 / l_lvl1
+//   level 0 (root): 1   node    -> m_lvl0 / l_lvl0
+// Total 2C-1 M nodes + 2C-1 L nodes = 7.27 KB at P=4, C=16.
+
+param memcpy_params : comptime_struct;
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const simprint = @import_module("<simprint>");
+
+// --- GLOBAL PARAMETERS (from layout) ---
+param cells_per_side : u16;   // C
+param prob_range : f32;
+param max_bodies_pe : u16;    // max bodies per leaf cell
+param cell_size : f32;
+
+// --- TOPOLOGY PARAMETERS (from layout) ---
+// In 2.5D the PE's plane position IS its (x,y) identity: no Morton decode.
+param pe_x_param : u16;
+param pe_y_param : u16;
+param parity_x : u16;   // pe_x % 2, for the even/odd color split
+param parity_y : u16;   // pe_y % 2
+
+// --- ROUTING COLORS (from layout) ---
+param color_e_even : color;
+param color_e_odd  : color;
+param color_w_even : color;
+param color_w_odd  : color;
+param color_n_even : color;
+param color_n_odd  : color;
+param color_s_even : color;
+param color_s_odd  : color;
+
+// --- MODULES ---
+const cons = @import_module("constants.csl", .{
+    .cells_per_side = cells_per_side,
+    .prob_range = prob_range,
+    .max_bodies_pe = max_bodies_pe,
+    .cell_size = cell_size,
+    .color_e_even = color_e_even, .color_e_odd = color_e_odd,
+    .color_w_even = color_w_even, .color_w_odd = color_w_odd,
+    .color_n_even = color_n_even, .color_n_odd = color_n_odd,
+    .color_s_even = color_s_even, .color_s_odd = color_s_odd,
+});
+const geom = @import_module("geometry.csl", .{
+    .prob_range = prob_range,
+    .cells_per_side = cells_per_side,
+    .TREE_H = cons.TREE_H,
+});
+const kernels = @import_module("kernels.csl", .{
+    .P = cons.P,
+    .M2M_N_ENTRIES = cons.M2M_N_ENTRIES,
+    .M2L_N_ENTRIES = cons.M2L_N_ENTRIES,
+    .L2L_N_ENTRIES = cons.L2L_N_ENTRIES,
+    .N_BUCKETS = cons.N_BUCKETS,
+    .P2P_PAYLOAD_SIZE = cons.P2P_PAYLOAD_SIZE,
+});
+
+// --- RUNTIME POSITION ---
+// Fixed for the whole column. Set by init_position (called in run_p2m).
+var pe_x : u16 = 0;
+var pe_y : u16 = 0;
+var center_x : f32 = 0.0;   // (pe_x + 0.5) * cell_size, fixed for column
+var center_y : f32 = 0.0;   // (pe_y + 0.5) * cell_size, fixed for column
+
+// ===========================================================================
+// OPERATOR TABLES (math block, loaded by host via memcpy; device buffers u32)
+// ===========================================================================
+// Identical to 3D: these are the reused, geometry-independent tables. Signs are
+// 4 bits packed into a u32 (upper 16 bits zero, memcpy requires u32 device
+// buffers). Same per PE (not scaling with C): ~4.46 KB.
+export var m2m_offsets       = @zeros([cons.N_BUCKETS]u16);
+export var m2m_child_indices = @zeros([cons.M2M_N_ENTRIES]u16);
+export var m2m_v_indices     = @zeros([cons.M2M_N_ENTRIES]u16);
+export var m2m_signs         = @zeros([cons.M2M_N_ENTRIES]u32);
+
+export var m2l_offsets        = @zeros([cons.N_BUCKETS]u16);
+export var m2l_source_indices = @zeros([cons.M2L_N_ENTRIES]u16);
+export var m2l_v_indices      = @zeros([cons.M2L_N_ENTRIES]u16);
+export var m2l_signs          = @zeros([cons.M2L_N_ENTRIES]u32);
+
+export var l2l_offsets        = @zeros([cons.N_BUCKETS]u16);
+export var l2l_source_indices = @zeros([cons.L2L_N_ENTRIES]u16);
+export var l2l_v_indices      = @zeros([cons.L2L_N_ENTRIES]u16);
+export var l2l_signs          = @zeros([cons.L2L_N_ENTRIES]u32);
+
+// ===========================================================================
+// M2L AGENDAS AND QUOTAS  (per level, loaded by host via memcpy)
+// ===========================================================================
+// m2l_agenda_lvlN: packed messages this PE ORIGINATES at level N. Each entry is
+// a u32 header-like word (tgt_x,tgt_y,tag,zbase,zcount) built by the generator
+// with the same field layout as the runtime header (minus msg_type/level, which
+// are known from the phase). num_send_lvlN = number of valid entries.
+export var m2l_agenda_lvl2 = @zeros([cons.MAX_AGENDA]u32);
+export var m2l_agenda_lvl3 = @zeros([cons.MAX_AGENDA]u32);
+export var m2l_agenda_lvl4 = @zeros([cons.MAX_AGENDA]u32);
+export var num_send_lvl2 = @zeros([1]u32);
+export var num_send_lvl3 = @zeros([1]u32);
+export var num_send_lvl4 = @zeros([1]u32);
+
+// Quotas: how many messages this PE will RECEIVE (own) and FORWARD per level.
+// Termination at a level: received == recv_expected AND forwarded == fwd_expected
+// AND all my sends launched. All three are geometry-known a priori.
+export var recv_expected_lvl2 = @zeros([1]u32);
+export var recv_expected_lvl3 = @zeros([1]u32);
+export var recv_expected_lvl4 = @zeros([1]u32);
+export var fwd_expected_lvl2 = @zeros([1]u32);
+export var fwd_expected_lvl3 = @zeros([1]u32);
+export var fwd_expected_lvl4 = @zeros([1]u32);
+
+// Runtime counters (decremented/incremented as the phase runs).
+var m2l_recv_count : u32 = 0;
+var m2l_fwd_count : u32 = 0;
+var m2l_send_idx : u32 = 0;        // next agenda entry to originate
+var m2l_cur_level : u16 = 4;       // M2L runs leaf-first (level 4 -> 3 -> 2)
+var m2l_phase_active : u16 = 0;
+
+// P2P runtime state. P2P is strictly 1-hop: each PE sends body-slabs to its <=8
+// plane neighbours and receives from them. No transit, no forwarding.
+// Cells per P2P message = how many cells' bodies fit in MSG_PAYLOAD_MAX floats.
+// Cells per P2P message: each cell block is (1 count + max_bodies*4) words, and
+// a message payload holds MSG_PAYLOAD_MAX floats.
+const P2P_CELL_STRIDE : u16 = 1 + max_bodies_pe * 4;
+const P2P_CELLS_PER_MSG : u16 = cons.MSG_PAYLOAD_MAX / P2P_CELL_STRIDE;
+var p2p_tx_slab = @zeros([cons.MSG_PAYLOAD_MAX]f32);  // slab assembly buffer
+var p2p_recv_count : u32 = 0;
+var p2p_recv_expected : u32 = 0;
+var p2p_phase_active : u16 = 0;
+var l2p_done : u16 = 0;
+
+// ===========================================================================
+// COLUMN BODIES  (Option 1: fixed per-cell blocks)
+// ===========================================================================
+// Layout: C contiguous cell blocks, each
+//   [ count (1 slot) | body_0 (x,y,z,q) | body_1 | ... | body_{max-1} ]
+// Block stride = 1 + max_bodies_pe*4 (in u32 slots; floats bitcast to u32).
+// Cell z's block starts at z * CELL_BLOCK.
+// Worst-case memory equals the dense layout, so we take the simple one.
+const CELL_BLOCK : u16 = 1 + max_bodies_pe * 4;
+const BODIES_COL_LEN : u16 = cells_per_side * CELL_BLOCK;
+export var bodies_col = @zeros([BODIES_COL_LEN]u32);
+
+// ===========================================================================
+// RESIDENT COLUMN STATE  (separate buffers per level, array along Z)
+// ===========================================================================
+// Flattened: level l buffer holds (2**l) expansions, each C_BUF_SIZE floats.
+// Node k at level l lives at offset k * C_BUF_SIZE.
+//
+// Nodes along Z: lvl4=C, lvl3=C/2, lvl2=C/4, lvl1=C/8, lvl0=1. For C=16 that is
+// 16, 8, 4, 2, 1. We size them from cells_per_side so the file is C-generic.
+
+const NZ4 : u16 = cells_per_side;          // 16
+const NZ3 : u16 = cells_per_side / 2;      // 8
+const NZ2 : u16 = cells_per_side / 4;      // 4
+const NZ1 : u16 = cells_per_side / 8;      // 2
+const NZ0 : u16 = 1;                       // 1
+
+// Multipole (M) buffers, upward pass. m_lvl4 is the P2M output.
+export var m_lvl4 = @zeros([NZ4 * cons.C_BUF_SIZE]f32);
+export var m_lvl3 = @zeros([NZ3 * cons.C_BUF_SIZE]f32);
+export var m_lvl2 = @zeros([NZ2 * cons.C_BUF_SIZE]f32);
+export var m_lvl1 = @zeros([NZ1 * cons.C_BUF_SIZE]f32);
+export var m_lvl0 = @zeros([NZ0 * cons.C_BUF_SIZE]f32);
+
+// Local (L) buffers, downward pass. Filled in phases (c)/(d).
+var l_lvl4 = @zeros([NZ4 * cons.C_BUF_SIZE]f32);
+var l_lvl3 = @zeros([NZ3 * cons.C_BUF_SIZE]f32);
+var l_lvl2 = @zeros([NZ2 * cons.C_BUF_SIZE]f32);
+var l_lvl1 = @zeros([NZ1 * cons.C_BUF_SIZE]f32);
+var l_lvl0 = @zeros([NZ0 * cons.C_BUF_SIZE]f32);
+
+// ===========================================================================
+// SCRATCH  (fixed, recycled per translation; does NOT grow with C)
+// ===========================================================================
+// contrib_buf: solid harmonics of one body (used by P2M).
+// v_buf / v_buf_m2l: translation-vector harmonics (used by M2M/L2L and M2L).
+var contrib_buf = @zeros([cons.C_BUF_SIZE]f32);
+var v_buf = @zeros([cons.C_BUF_SIZE]f32);
+var v_buf_m2l = @zeros([cons.C_BUF_M2L_SIZE]f32);
+
+// ===========================================================================
+// RESULTS  (per body in the column: fx, fy, fz, pot)
+// ===========================================================================
+// One block of max_bodies_pe*4 per cell, same per-cell stride idea as bodies.
+export var forces_col = @zeros([cells_per_side * max_bodies_pe * 4]f32);
+export var fmm_done = @zeros([1]u32);
+
+
+// ===========================================================================
+// ===========================================================================
+//                    TRANSPORT LAYER  (phase d)
+// ===========================================================================
+// ===========================================================================
+//
+// XY dimension-order routing, deadlock-free by construction:
+//   - a message travels along X to target_x, then along Y to target_y;
+//   - RECEIVE is always active: a direction's rx data task drains the whole
+//     message (header + K-cube payload, fixed length) into a free rx buffer,
+//     then handles it (process if ours, else forward);
+//   - FORWARD and ORIGINATE share NBUF tx buffers per direction; a message that
+//     cannot claim a free tx buffer waits in its rx buffer (which backpressures
+//     only the fabric on that side);
+//   - FLOW CONTROL is emergent: receive never blocks on send; send proceeds
+//     whenever a tx buffer is free. The send/receive rhythm balances itself via
+//     the symmetric interaction list.
+//
+// Deadlock-freedom: XY makes the channel graph acyclic; a downstream PE always
+// drains, so a tx buffer always eventually frees, so a waiting rx buffer always
+// eventually frees. No permanent block is possible.
+//
+// Direction codes used throughout: 0=E, 1=W, 2=N, 3=S.
+
+// --- Color selection by parity (fabric requirement) ---------------------
+// A PE uses, for an OUTGOING direction, the color of its own parity on that
+// axis. The neighbour it sends to receives on the opposite-parity color, so a
+// color never overlaps itself on consecutive hops.
+const c_e_out = if (parity_x == 0) cons.color_e_even else cons.color_e_odd;
+const c_w_out = if (parity_x == 0) cons.color_w_even else cons.color_w_odd;
+const c_n_out = if (parity_y == 0) cons.color_n_even else cons.color_n_odd;
+const c_s_out = if (parity_y == 0) cons.color_s_even else cons.color_s_odd;
+
+const c_e_in = if (parity_x == 0) cons.color_w_odd  else cons.color_w_even;
+const c_w_in = if (parity_x == 0) cons.color_e_odd  else cons.color_e_even;
+const c_n_in = if (parity_y == 0) cons.color_s_odd  else cons.color_s_even;
+const c_s_in = if (parity_y == 0) cons.color_n_odd  else cons.color_n_even;
+
+// --- TX buffers: NBUF per direction, shared by originations and forwards -
+// Flat [NBUF * MSG_SIZE]; slot s starts at s*MSG_SIZE. A simple free/busy ring.
+var tx_buf_e = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var tx_buf_w = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var tx_buf_n = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var tx_buf_s = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+
+// Per direction: how many tx buffers are in flight, and the next slot to use.
+var tx_inflight_e : u16 = 0; var tx_next_e : u16 = 0;
+var tx_inflight_w : u16 = 0; var tx_next_w : u16 = 0;
+var tx_inflight_n : u16 = 0; var tx_next_n : u16 = 0;
+var tx_inflight_s : u16 = 0; var tx_next_s : u16 = 0;
+
+// --- RX buffers: NBUF per direction -------------------------------------
+var rx_buf_e = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var rx_buf_w = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var rx_buf_n = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var rx_buf_s = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
+var rx_next_e : u16 = 0;
+var rx_next_w : u16 = 0;
+var rx_next_n : u16 = 0;
+var rx_next_s : u16 = 0;
+
+// --- DSDs (output), one per direction, extent MSG_SIZE ------------------
+// Color is bound to the queue via @initialize_queue (comptime), NOT passed here
+// (matches the working WSE-3 reference pattern).
+const tx_dsd_e = @get_dsd(fabout_dsd, .{ .extent = cons.MSG_SIZE, .output_queue = cons.e_oq });
+const tx_dsd_w = @get_dsd(fabout_dsd, .{ .extent = cons.MSG_SIZE, .output_queue = cons.w_oq });
+const tx_dsd_n = @get_dsd(fabout_dsd, .{ .extent = cons.MSG_SIZE, .output_queue = cons.n_oq });
+const tx_dsd_s = @get_dsd(fabout_dsd, .{ .extent = cons.MSG_SIZE, .output_queue = cons.s_oq });
+
+// --- DSDs (input), one per direction, extent MSG_SIZE -------------------
+// Fixed-length receive of the whole message (header + K-cube payload). The
+// receive is an explicit async @mov32 from the fabin DSD (NO data task): WE
+// control when to drain. Every plane message is exactly MSG_SIZE wavelets.
+const rx_dsd_e = @get_dsd(fabin_dsd, .{ .extent = cons.MSG_SIZE, .input_queue = cons.e_iq });
+const rx_dsd_w = @get_dsd(fabin_dsd, .{ .extent = cons.MSG_SIZE, .input_queue = cons.w_iq });
+const rx_dsd_n = @get_dsd(fabin_dsd, .{ .extent = cons.MSG_SIZE, .input_queue = cons.n_iq });
+const rx_dsd_s = @get_dsd(fabin_dsd, .{ .extent = cons.MSG_SIZE, .input_queue = cons.s_iq });
+
+// --- Header build / parse -----------------------------------------------
+fn build_header(tgt_x: u16, tgt_y: u16, msg_type: u16, level: u16,
+                tag: u16, zcount: u16, zbase: u16) u32 {
+    var h : u32 = (@as(u32, tgt_x) & cons.MASK_4BIT) << cons.SHIFT_TGT_X;
+    h |= (@as(u32, tgt_y) & cons.MASK_4BIT) << cons.SHIFT_TGT_Y;
+    h |= (@as(u32, msg_type) & cons.MASK_2BIT) << cons.SHIFT_MSG_TYPE;
+    h |= (@as(u32, level - 2) & cons.MASK_2BIT) << cons.SHIFT_LEVEL;
+    h |= (@as(u32, tag) & cons.MASK_9BIT) << cons.SHIFT_TAG;
+    h |= (@as(u32, zcount) & cons.MASK_3BIT) << cons.SHIFT_ZCOUNT;
+    h |= (@as(u32, zbase) & cons.MASK_4BIT) << cons.SHIFT_ZBASE;
+    return h;
+}
+fn hdr_tgt_x(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_TGT_X) & cons.MASK_4BIT); }
+fn hdr_tgt_y(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_TGT_Y) & cons.MASK_4BIT); }
+fn hdr_msg_type(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_MSG_TYPE) & cons.MASK_2BIT); }
+fn hdr_level(h: u32) u16 { return @as(u16, ((h >> cons.SHIFT_LEVEL) & cons.MASK_2BIT) + 2); }
+fn hdr_tag(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_TAG) & cons.MASK_9BIT); }
+fn hdr_zcount(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_ZCOUNT) & cons.MASK_3BIT); }
+fn hdr_zbase(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_ZBASE) & cons.MASK_4BIT); }
+
+// Number of payload floats in a message of the given header: zcount cubes.
+fn msg_payload_len(h: u32) u16 { return hdr_zcount(h) * cons.C_BUF_SIZE; }
+
+// --- Low-level: copy header+payload into a tx slot and launch async ------
+// src points at a MSG_PAYLOAD_MAX-sized payload buffer; we write header to
+// slot[0] then payload to slot[1..1+plen], then fire the whole MSG_SIZE async.
+fn tx_launch(dir: u16, slot_base: u16, header: u32,
+             src: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) void {
+    // The payload copy uses the message's real length; the fabric send is fixed
+    // MSG_SIZE so the receiver always drains a whole message (unused tail is
+    // whatever was in the slot; receiver ignores beyond plen via header zcount).
+    if (dir == 0) {
+        tx_buf_e[slot_base] = @bitcast(f32, header);
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_e[slot_base + 1]));
+        const dl = @set_dsd_length(d, plen);
+        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        const sl = @set_dsd_length(s, plen);
+        @fmovs(dl, sl);
+        var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_e[i] });
+        send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_e[slot_base]));
+        @mov32(tx_dsd_e, send, .{ .async = true, .ut_id = @get_ut_id(2), .activate = cons.tx_complete_e_id });
+    } else if (dir == 1) {
+        tx_buf_w[slot_base] = @bitcast(f32, header);
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_w[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_w[slot_base + 1]));
+        const dl = @set_dsd_length(d, plen);
+        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        const sl = @set_dsd_length(s, plen);
+        @fmovs(dl, sl);
+        var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_w[i] });
+        send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_w[slot_base]));
+        @mov32(tx_dsd_w, send, .{ .async = true, .ut_id = @get_ut_id(3), .activate = cons.tx_complete_w_id });
+    } else if (dir == 2) {
+        tx_buf_n[slot_base] = @bitcast(f32, header);
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_n[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_n[slot_base + 1]));
+        const dl = @set_dsd_length(d, plen);
+        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        const sl = @set_dsd_length(s, plen);
+        @fmovs(dl, sl);
+        var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_n[i] });
+        send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_n[slot_base]));
+        @mov32(tx_dsd_n, send, .{ .async = true, .ut_id = @get_ut_id(4), .activate = cons.tx_complete_n_id });
+    } else {
+        tx_buf_s[slot_base] = @bitcast(f32, header);
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_s[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_s[slot_base + 1]));
+        const dl = @set_dsd_length(d, plen);
+        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        const sl = @set_dsd_length(s, plen);
+        @fmovs(dl, sl);
+        var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_s[i] });
+        send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_s[slot_base]));
+        @mov32(tx_dsd_s, send, .{ .async = true, .ut_id = @get_ut_id(5), .activate = cons.tx_complete_s_id });
+    }
+}
+
+// Is a tx buffer free in this direction? (inflight < NBUF)
+fn tx_has_free(dir: u16) bool {
+    if (dir == 0) return tx_inflight_e < cons.NBUF;
+    if (dir == 1) return tx_inflight_w < cons.NBUF;
+    if (dir == 2) return tx_inflight_n < cons.NBUF;
+    return tx_inflight_s < cons.NBUF;
+}
+
+// Claim a free tx slot base and advance the ring; caller must have checked free.
+fn tx_claim(dir: u16) u16 {
+    if (dir == 0) { const b = tx_next_e * cons.MSG_SIZE; tx_next_e = (tx_next_e + 1) % cons.NBUF; tx_inflight_e += 1; return b; }
+    if (dir == 1) { const b = tx_next_w * cons.MSG_SIZE; tx_next_w = (tx_next_w + 1) % cons.NBUF; tx_inflight_w += 1; return b; }
+    if (dir == 2) { const b = tx_next_n * cons.MSG_SIZE; tx_next_n = (tx_next_n + 1) % cons.NBUF; tx_inflight_n += 1; return b; }
+    const b = tx_next_s * cons.MSG_SIZE; tx_next_s = (tx_next_s + 1) % cons.NBUF; tx_inflight_s += 1; return b;
+}
+
+// --- Dimension-order out-direction for a target ------------------------
+// Returns 0=E,1=W,2=N,3=S, or 4 if the target IS this PE (local).
+fn out_dir_for(tgt_x: u16, tgt_y: u16) u16 {
+    if (tgt_x == pe_x and tgt_y == pe_y) return 4;
+    if (tgt_x != pe_x) {
+        if (tgt_x > pe_x) return 0 else return 1;
+    }
+    if (tgt_y > pe_y) return 3 else return 2;
+}
+
+// --- SEND: try to launch a message toward (tgt_x,tgt_y) -----------------
+// Returns true if launched or delivered locally; false if the needed tx
+// direction has no free buffer (caller retries later).
+fn try_send(tgt_x: u16, tgt_y: u16, header: u32,
+            payload: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) bool {
+    const dir = out_dir_for(tgt_x, tgt_y);
+    if (dir == 4) {
+        process_message_local_payload(header, payload, plen);
+        return true;
+    }
+    if (!tx_has_free(dir)) return false;
+    const slot = tx_claim(dir);
+    tx_launch(dir, slot, header, payload, plen);
+    return true;
+}
+
+// --- Handle a fully-received message (payload already in rx buffer) -----
+// If for us: process. Else: try to forward; if no tx buffer free, the caller
+// leaves it in its rx buffer (we signal failure so rx is not yet reused).
+// Returns true if consumed (processed or forwarded), false if must stay in rx.
+fn handle_message(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) bool {
+    if (hdr_tgt_x(header) == pe_x and hdr_tgt_y(header) == pe_y) {
+        process_message_local_payload(header, payload, plen);
+        return true;
+    }
+    const forwarded = try_send(hdr_tgt_x(header), hdr_tgt_y(header), header, payload, plen);
+    if (forwarded) {
+        note_forward();   // count a successfully forwarded transit message
+    }
+    return forwarded;
+}
+
+// --- RX: armed async drains + completion tasks (NO data tasks) -----------
+// Following the working WSE-3 reference: receive is an explicit async @mov32
+// from the fabin DSD into a memory slot, activating a completion task. WE decide
+// when to drain (an "armed" drain per direction); on completion we handle the
+// message and RE-ARM the drain so the direction is always listening. This is the
+// non-blocking receive we need, and because we control the drain there is no
+// data-task redispatch ambiguity.
+//
+// A drain is armed per direction. rx_armed_<dir> guards against double-arming.
+
+var rx_armed_e : u16 = 0; var rx_armed_w : u16 = 0;
+var rx_armed_n : u16 = 0; var rx_armed_s : u16 = 0;
+var fwd_pending_e : u16 = 0; var fwd_pending_w : u16 = 0;
+var fwd_pending_n : u16 = 0; var fwd_pending_s : u16 = 0;
+
+// Arm a drain on a direction: async @mov32 fabin -> rx slot, activate completion.
+fn arm_drain(dir: u16) void {
+    if (dir == 0) {
+        if (rx_armed_e == 1 or fwd_pending_e == 1) return;
+        rx_armed_e = 1;
+        const sb = rx_next_e * cons.MSG_SIZE;
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_e[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_e[sb]));
+        @mov32(d, rx_dsd_e, .{ .async = true, .activate = cons.rx_complete_e_id });
+    } else if (dir == 1) {
+        if (rx_armed_w == 1 or fwd_pending_w == 1) return;
+        rx_armed_w = 1;
+        const sb = rx_next_w * cons.MSG_SIZE;
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_w[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_w[sb]));
+        @mov32(d, rx_dsd_w, .{ .async = true, .activate = cons.rx_complete_w_id });
+    } else if (dir == 2) {
+        if (rx_armed_n == 1 or fwd_pending_n == 1) return;
+        rx_armed_n = 1;
+        const sb = rx_next_n * cons.MSG_SIZE;
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_n[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_n[sb]));
+        @mov32(d, rx_dsd_n, .{ .async = true, .activate = cons.rx_complete_n_id });
+    } else {
+        if (rx_armed_s == 1 or fwd_pending_s == 1) return;
+        rx_armed_s = 1;
+        const sb = rx_next_s * cons.MSG_SIZE;
+        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_s[i] });
+        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_s[sb]));
+        @mov32(d, rx_dsd_s, .{ .async = true, .activate = cons.rx_complete_s_id });
+    }
+}
+
+// Completion: a message fully arrived in the direction's rx slot. Handle it;
+// if forwarded or local, advance the slot and re-arm. If it could not be
+// forwarded (no tx buffer), mark fwd_pending and DON'T re-arm until it clears.
+fn rx_complete(dir: u16) void {
+    var sb : u16 = 0;
+    var header : u32 = 0;
+    if (dir == 0) { rx_armed_e = 0; sb = rx_next_e * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_e[sb]); }
+    else if (dir == 1) { rx_armed_w = 0; sb = rx_next_w * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_w[sb]); }
+    else if (dir == 2) { rx_armed_n = 0; sb = rx_next_n * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_n[sb]); }
+    else { rx_armed_s = 0; sb = rx_next_s * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_s[sb]); }
+
+    const plen = msg_payload_len(header);
+    // Payload pointer into this direction's rx slot (just past the header word).
+    var pay : *[cons.MSG_PAYLOAD_MAX]f32 = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_e[sb + 1]);
+    if (dir == 1) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_w[sb + 1]); }
+    else if (dir == 2) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_n[sb + 1]); }
+    else if (dir == 3) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_s[sb + 1]); }
+
+    const ok = handle_message(header, pay, plen);
+    if (ok) {
+        if (dir == 0) { rx_next_e = (rx_next_e + 1) % cons.NBUF; }
+        else if (dir == 1) { rx_next_w = (rx_next_w + 1) % cons.NBUF; }
+        else if (dir == 2) { rx_next_n = (rx_next_n + 1) % cons.NBUF; }
+        else { rx_next_s = (rx_next_s + 1) % cons.NBUF; }
+        arm_drain(dir);   // re-arm: keep listening
+    } else {
+        // couldn't forward; hold the message, mark pending. tx_complete retries.
+        if (dir == 0) { fwd_pending_e = 1; }
+        else if (dir == 1) { fwd_pending_w = 1; }
+        else if (dir == 2) { fwd_pending_n = 1; }
+        else { fwd_pending_s = 1; }
+    }
+}
+
+task rx_complete_e() void { rx_complete(0); }
+task rx_complete_w() void { rx_complete(1); }
+task rx_complete_n() void { rx_complete(2); }
+task rx_complete_s() void { rx_complete(3); }
+
+// Retry a pending forward held in an rx slot (called from tx completion).
+fn retry_pending_fwd(dir: u16) void {
+    if (dir == 0 and fwd_pending_e == 1) {
+        const sb = rx_next_e * cons.MSG_SIZE;
+        const header = @bitcast(u32, rx_buf_e[sb]);
+        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_e[sb + 1]);
+        if (handle_message(header, pay, msg_payload_len(header))) {
+            rx_next_e = (rx_next_e + 1) % cons.NBUF; fwd_pending_e = 0; arm_drain(0);
+        }
+    } else if (dir == 1 and fwd_pending_w == 1) {
+        const sb = rx_next_w * cons.MSG_SIZE;
+        const header = @bitcast(u32, rx_buf_w[sb]);
+        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_w[sb + 1]);
+        if (handle_message(header, pay, msg_payload_len(header))) {
+            rx_next_w = (rx_next_w + 1) % cons.NBUF; fwd_pending_w = 0; arm_drain(1);
+        }
+    } else if (dir == 2 and fwd_pending_n == 1) {
+        const sb = rx_next_n * cons.MSG_SIZE;
+        const header = @bitcast(u32, rx_buf_n[sb]);
+        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_n[sb + 1]);
+        if (handle_message(header, pay, msg_payload_len(header))) {
+            rx_next_n = (rx_next_n + 1) % cons.NBUF; fwd_pending_n = 0; arm_drain(2);
+        }
+    } else if (dir == 3 and fwd_pending_s == 1) {
+        const sb = rx_next_s * cons.MSG_SIZE;
+        const header = @bitcast(u32, rx_buf_s[sb]);
+        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_s[sb + 1]);
+        if (handle_message(header, pay, msg_payload_len(header))) {
+            rx_next_s = (rx_next_s + 1) % cons.NBUF; fwd_pending_s = 0; arm_drain(3);
+        }
+    }
+}
+
+// Arm drains on all four directions (called at phase start to begin listening).
+fn arm_all_drains() void {
+    arm_drain(0); arm_drain(1); arm_drain(2); arm_drain(3);
+}
+
+// --- TX completion: free a buffer, retry pending forwards, poke sender ---
+task tx_complete_e() void {
+    if (tx_inflight_e > 0) tx_inflight_e -= 1;
+    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
+    @activate(cons.m2l_send_task_id);
+}
+task tx_complete_w() void {
+    if (tx_inflight_w > 0) tx_inflight_w -= 1;
+    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
+    @activate(cons.m2l_send_task_id);
+}
+task tx_complete_n() void {
+    if (tx_inflight_n > 0) tx_inflight_n -= 1;
+    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
+    @activate(cons.m2l_send_task_id);
+}
+task tx_complete_s() void {
+    if (tx_inflight_s > 0) tx_inflight_s -= 1;
+    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
+    @activate(cons.m2l_send_task_id);
+}
+
+// ===========================================================================
+// M2L LOGIC  (phase d, step 2)
+// ===========================================================================
+//
+// Receiver: a message carries zcount source-cube multipoles (starting at source
+// Z index zbase) bound for a destination plane column. The tag gives the planar
+// translation (dx,dy); the per-cube dz is reconstructed from the source cube's
+// Z index and this PE's target cube Z index. For each (source cube, target
+// cube) pair whose dz is within the M2L range, apply m2l_translate accumulating
+// into the target cube's local expansion l_lvlN.
+//
+// Level buffers: at level N, source cubes are the sender's m_lvlN nodes; targets
+// are this PE's l_lvlN nodes. nz = grid_boxes(N) cubes along Z.
+
+fn apply_m2l_message(level: u16, tag: u16, zbase: u16, zcount: u16,
+                     payload: *[cons.MSG_PAYLOAD_MAX]f32) void {
+    const nz : u16 = geom.grid_boxes(level);
+    const l_target = l_level_ptr(level);
+    const b_size : f32 = cons.box_size_at_level[level];
+
+    // planar translation from tag
+    var dxp : i16 = 0; var dyp : i16 = 0; var dzp0 : i16 = 0;
+    geom.get_indices_from_tag(tag, &dxp, &dyp, &dzp0);  // dzp0 unused (tag dz=0)
+
+    // For each source cube in this message and each target cube in this column,
+    // the dz is (target_z - source_z). Apply M2L where the full 3D vector is a
+    // valid interaction (2 <= max(|dx|,|dy|,|dz|) <= 3).
+    for (@range(u16, zcount)) |ci| {
+        const src_z : u16 = zbase + ci;
+        const src_base : u16 = ci * cons.C_BUF_SIZE;   // this cube's expansion in payload
+        var src_exp = @ptrcast(*[cons.C_BUF_SIZE]f32, &payload.*[src_base]);
+
+        for (@range(u16, nz)) |tz| {
+            const dz : i16 = @as(i16, tz) - @as(i16, src_z);
+            // full 3D separation check
+            var adx : i16 = if (dxp < 0) -dxp else dxp;
+            var ady : i16 = if (dyp < 0) -dyp else dyp;
+            var adz : i16 = if (dz  < 0) -dz  else dz;
+            var mx : i16 = if (adx > ady) adx else ady;
+            if (adz > mx) mx = adz;
+            if (mx < 2 or mx > 3) continue;
+
+            // physical translation vector and its 2P harmonics
+            var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
+            geom.get_physical_distances(dxp, dyp, dz, b_size, &dist_x, &dist_y, &dist_z);
+            kernels.compute_solid_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
+
+            var tgt_exp = @ptrcast(*[cons.C_BUF_SIZE]f32, &l_target.*[tz * cons.C_BUF_SIZE]);
+            kernels.m2l_translate(&v_buf_m2l, src_exp, tgt_exp,
+                &m2l_offsets, &m2l_source_indices, &m2l_v_indices, &m2l_signs);
+        }
+    }
+}
+
+fn get_recv_expected(level: u16) u32 {
+    if (level == 2) return recv_expected_lvl2[0];
+    if (level == 3) return recv_expected_lvl3[0];
+    return recv_expected_lvl4[0];
+}
+fn get_fwd_expected(level: u16) u32 {
+    if (level == 2) return fwd_expected_lvl2[0];
+    if (level == 3) return fwd_expected_lvl3[0];
+    return fwd_expected_lvl4[0];
+}
+fn get_num_send(level: u16) u32 {
+    if (level == 2) return num_send_lvl2[0];
+    if (level == 3) return num_send_lvl3[0];
+    return num_send_lvl4[0];
+}
+fn get_agenda_entry(level: u16, idx: u32) u32 {
+    if (level == 2) return m2l_agenda_lvl2[idx];
+    if (level == 3) return m2l_agenda_lvl3[idx];
+    return m2l_agenda_lvl4[idx];
+}
+
+// --- Dispatch: a fully-received message destined for this PE -------------
+fn process_message_local_payload(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) void {
+    const mtype = hdr_msg_type(header);
+    if (mtype == @as(u16, cons.MSG_M2L)) {
+        const level = hdr_level(header);
+        const tag = hdr_tag(header);
+        const zbase = hdr_zbase(header);
+        const zcount = hdr_zcount(header);
+        apply_m2l_message(level, tag, zbase, zcount, payload);
+        m2l_recv_count += 1;
+        check_m2l_done();
+    } else if (mtype == @as(u16, cons.MSG_M2M)) {
+        const level = hdr_level(header);
+        const zbase = hdr_zbase(header);
+        const zcount = hdr_zcount(header);
+        m2m_plane_accumulate(level, zbase, zcount, payload);
+    } else if (mtype == @as(u16, cons.MSG_L2L)) {
+        const level = hdr_level(header);
+        const zbase = hdr_zbase(header);
+        const zcount = hdr_zcount(header);
+        l2l_plane_receive(level, zbase, zcount, payload);
+    } else {
+        // MSG_P2P: a slab of remote-neighbor bodies. tag = planar (dx,dy),
+        // zbase = first source cell index, zcount = number of source cells.
+        const tag = hdr_tag(header);
+        const cbase = hdr_zbase(header);
+        const ccount = hdr_zcount(header);
+        apply_p2p_message(tag, cbase, ccount, payload);
+        p2p_recv_count += 1;
+        check_p2p_done();
+    }
+}
+
+// Count a forwarded message (called when handle_message forwards, not local).
+fn note_forward() void {
+    m2l_fwd_count += 1;
+    check_m2l_done();
+}
+
+// --- M2L sender: inject own originations into tx-buffer slack ------------
+// Activated at phase start and after each tx completion. Sends as many of this
+// PE's agenda entries as there are free tx buffers in the needed direction.
+// Forwarding has priority (handled in tx_complete before this runs).
+fn build_m2l_header(entry: u32, level: u16) u32 {
+    // The agenda entry already packs tgt_x,tgt_y,tag,zbase,zcount in the runtime
+    // header field positions (generator uses the same shifts). We OR in the
+    // msg_type and level, which the generator leaves zero.
+    var h : u32 = entry;
+    h |= (@as(u32, cons.MSG_M2L) & cons.MASK_2BIT) << cons.SHIFT_MSG_TYPE;
+    h |= (@as(u32, level - 2) & cons.MASK_2BIT) << cons.SHIFT_LEVEL;
+    return h;
+}
+
+fn m2l_src_ptr(level: u16, zbase: u16) *[cons.MSG_PAYLOAD_MAX]f32 {
+    // Source multipoles for this message = m_lvlN starting at cube zbase. We
+    // return a pointer into the level's M buffer; since a message carries up to
+    // K contiguous cubes, this is a contiguous slice.
+    const m = m_level_ptr(level);
+    return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &m.*[zbase * cons.C_BUF_SIZE]);
+}
+
+task m2l_send_task() void {
+    if (m2l_phase_active == 0) return;
+    const level = m2l_cur_level;
+    const nsend = get_num_send(level);
+
+    // Try to launch agenda entries until we run out or a direction is full.
+    while (m2l_send_idx < nsend) {
+        const entry = get_agenda_entry(level, m2l_send_idx);
+        const header = build_m2l_header(entry, level);
+        const tgt_x = hdr_tgt_x(header);
+        const tgt_y = hdr_tgt_y(header);
+        const zbase = hdr_zbase(header);
+        const plen = hdr_zcount(header) * cons.C_BUF_SIZE;
+        var src = m2l_src_ptr(level, zbase);
+        const sent = try_send(tgt_x, tgt_y, header, src, plen);
+        if (sent) {
+            m2l_send_idx += 1;
+        } else {
+            // direction full: stop; tx_complete will re-activate us later.
+            return;
+        }
+    }
+    // all sends for this level launched; completion is checked on each rx/fwd.
+    check_m2l_done();
+}
+
+// --- Termination check for the current M2L level ------------------------
+fn check_m2l_done() void {
+    const level = m2l_cur_level;
+    const sends_done = (m2l_send_idx >= get_num_send(level));
+    const recv_done = (m2l_recv_count >= get_recv_expected(level));
+    const fwd_done = (m2l_fwd_count >= get_fwd_expected(level));
+    if (sends_done and recv_done and fwd_done) {
+        advance_m2l_level();
+    }
+}
+
+fn advance_m2l_level() void {
+    // Reset counters and move to the next (coarser) level, or finish M2L.
+    if (m2l_cur_level > 2) {
+        m2l_cur_level -= 1;
+        m2l_recv_count = 0;
+        m2l_fwd_count = 0;
+        m2l_send_idx = 0;
+        @activate(cons.m2l_send_task_id);
+    } else {
+        m2l_phase_active = 0;
+        simprint.fmt("({d},{d}) M2L PHASE DONE", .{pe_x, pe_y});
+        phase_signal_done();   // host barrier: next phase is run_l2l_downward
+    }
+}
+
+fn start_m2l_phase() void {
+    simprint.fmt("({d},{d}) START M2L", .{pe_x, pe_y});
+    m2l_phase_active = 1;
+    m2l_cur_level = 4;      // leaf-first
+    m2l_recv_count = 0;
+    m2l_fwd_count = 0;
+    m2l_send_idx = 0;
+    @activate(cons.m2l_send_task_id);
+}
+
+
+// ===========================================================================
+// P2M  (phase b core: zero communication)
+// ===========================================================================
+// For each leaf cell z in the column, build its 3D multipole from the bodies
+// stored in that cell's block. Writes into m_lvl4[z].
+//
+// Body positions are absolute (domain coordinates); the multipole is expanded
+// about the cell center (center_x, center_y, cz) where cz depends on z.
+
+fn cell_center_z(z: u16) f32 {
+    return (@as(f32, z) + 0.5) * cell_size;
+}
+
+fn compute_p2m_cell(z: u16) void {
+    // Pointer to this cell's slot in the leaf multipole buffer.
+    const m_base : u16 = z * cons.C_BUF_SIZE;
+
+    // Clear this cell's multipole accumulator.
+    for (@range(u16, cons.C_BUF_SIZE)) |i| {
+        m_lvl4[m_base + i] = 0.0;
+    }
+
+    const blk : u16 = z * CELL_BLOCK;
+    const count : u16 = @as(u16, bodies_col[blk]);
+    const body0 : u16 = blk + 1;
+
+    const cz : f32 = cell_center_z(z);
+
+    for (@range(u16, count)) |b| {
+        const ib : u16 = body0 + b * 4;
+        const bx : f32 = @bitcast(f32, bodies_col[ib]);
+        const by : f32 = @bitcast(f32, bodies_col[ib + 1]);
+        const bz : f32 = @bitcast(f32, bodies_col[ib + 2]);
+        const q  : f32 = @bitcast(f32, bodies_col[ib + 3]);
+
+        const dx : f32 = bx - center_x;
+        const dy : f32 = by - center_y;
+        const dz : f32 = bz - cz;
+
+        // Solid harmonics of this body's offset, into scratch.
+        kernels.compute_solid_harmonics(dx, dy, dz, &contrib_buf);
+
+        // Accumulate q * contrib into this cell's multipole.
+        // (fmacs: SIMD-4 add path; the scalar fmul is inside compute_solid_harmonics.)
+        const m_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.C_BUF_SIZE} -> m_lvl4[i] });
+        var m_dsd_cell = @set_dsd_base_addr(m_dsd, @ptrcast([*]f32, &m_lvl4[m_base]));
+        const c_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.C_BUF_SIZE} -> contrib_buf[i] });
+        @fmacs(m_dsd_cell, m_dsd_cell, c_dsd, q);
+    }
+}
+
+// Run P2M for every leaf cell in the column.
+fn compute_p2m_column() void {
+    for (@range(u16, cells_per_side)) |z| {
+        compute_p2m_cell(z);
+    }
+}
+
+
+// ===========================================================================
+// M2M / L2L  (phase c: MATH ONLY, plane router is a stub for phase d)
+// ===========================================================================
+//
+// A tree node (box) spans, on the plane, an s x s block of PEs (s =
+// cells_per_box(parent_level)) and, along Z, is local to the column. Its 8
+// children split into:
+//   - 2 Z-LOCAL children: same (X,Y) column, Z indices (2*pz, 2*pz+1). Merged
+//     in SRAM, ZERO hops. This is what phase c implements.
+//   - 6 PLANE children: on other plane PEs. They arrive via the router (phase
+//     d). Here we only reserve the hook (m2m_recv_plane_contrib stub).
+//
+// child_id bits: bit0 = X, bit1 = Y, bit2 = Z (matches get_translation_vector).
+// For the Z-local pair, the X,Y bits are this PE's offset within the parent
+// block (relative to the parent representative); the Z bit is 0 / 1.
+//
+// Buffer pointer helpers: each level buffer is flat [n_z * C_BUF_SIZE]; node k
+// starts at k * C_BUF_SIZE.
+
+fn m_level_ptr(level: u16) *[cons.C_BUF_SIZE]f32 {
+    // Returns a pointer to element 0 of the level's flat buffer. The caller
+    // offsets by node index. We expose typed slices per level.
+    if (level == 4) return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_lvl4[0]);
+    if (level == 3) return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_lvl3[0]);
+    if (level == 2) return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_lvl2[0]);
+    if (level == 1) return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_lvl1[0]);
+    return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_lvl0[0]);
+}
+
+fn l_level_ptr(level: u16) *[cons.C_BUF_SIZE]f32 {
+    if (level == 4) return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl4[0]);
+    if (level == 3) return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl3[0]);
+    if (level == 2) return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl2[0]);
+    if (level == 1) return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl1[0]);
+    return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl0[0]);
+}
+
+// This PE's (X,Y) offset bits within the block of a box at `parent_level`.
+// The parent box representative is aligned to cells_per_box(parent_level).
+// The child cells are aligned to cells_per_box(parent_level+1) = half. So the
+// X,Y child_id bits are (pe_x / child_s) & 1, (pe_y / child_s) & 1, where
+// child_s = cells_per_box(child_level).
+fn plane_child_bits(child_level: u16, bit_x: *u16, bit_y: *u16) void {
+    const child_s : u16 = geom.cells_per_box(child_level);
+    bit_x.* = (pe_x / child_s) & 1;
+    bit_y.* = (pe_y / child_s) & 1;
+}
+
+// Z-LOCAL M2M: aggregate the two Z children (2*pz, 2*pz+1) at child_level into
+// parent node pz at parent_level, accumulating into the parent's M buffer.
+// Pure, local, zero communication. Verifiable against a direct reference.
+fn m2m_z_local(child_level: u16) void {
+    const parent_level : u16 = child_level - 1;
+    const nz_parent : u16 = geom.grid_boxes(parent_level);
+
+    const child_m = m_level_ptr(child_level);
+    const parent_m = m_level_ptr(parent_level);
+
+    var bit_x : u16 = 0;
+    var bit_y : u16 = 0;
+    plane_child_bits(child_level, &bit_x, &bit_y);
+
+    for (@range(u16, nz_parent)) |pz| {
+        const cz0 : u16 = 2 * pz;      // Z child with z-bit 0
+        const cz1 : u16 = 2 * pz + 1;  // Z child with z-bit 1
+
+        // child_id for each Z child: X,Y bits fixed by this PE's block offset,
+        // Z bit is 0 / 1.
+        const cid0 : u16 = bit_x | (bit_y << 1) | (0 << 2);
+        const cid1 : u16 = bit_x | (bit_y << 1) | (1 << 2);
+
+        // Translation vector child -> parent, then its harmonics into v_buf.
+        //
+        // SIGN CONVENTION (verified numerically against a direct reference, rel
+        // ~1e-15): the representative/parent is the LOW corner (min pe_x, pe_y,
+        // low Z). get_translation_vector gives +half for child_id bit 0, but a
+        // low-corner child's center lies BELOW the parent center, so the true
+        // child->parent offset is NEGATED. get_translation_vector is called with
+        // CHILD_level (its half_child_size = child box half-side = the offset
+        // magnitude). This matches how the 3D L2L negated its vector.
+        var t_vec = @zeros([3]f32);
+
+        geom.get_translation_vector(@as(u32, cid0), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child0 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_m.*[cz0 * cons.C_BUF_SIZE]);
+        var par = @ptrcast(*[cons.C_BUF_SIZE]f32, &parent_m.*[pz * cons.C_BUF_SIZE]);
+        kernels.m2m_translate(&v_buf, child0, par,
+            &m2m_offsets, &m2m_child_indices, &m2m_v_indices, &m2m_signs);
+
+        geom.get_translation_vector(@as(u32, cid1), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child1 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_m.*[cz1 * cons.C_BUF_SIZE]);
+        kernels.m2m_translate(&v_buf, child1, par,
+            &m2m_offsets, &m2m_child_indices, &m2m_v_indices, &m2m_signs);
+    }
+}
+
+// Z-LOCAL L2L: propagate a parent local expansion down to its two Z children.
+// Mirror of m2m_z_local; the translation vector is parent -> child (negated).
+fn l2l_z_local(parent_level: u16) void {
+    const child_level : u16 = parent_level + 1;
+    const nz_parent : u16 = geom.grid_boxes(parent_level);
+
+    const parent_l = l_level_ptr(parent_level);
+    const child_l = l_level_ptr(child_level);
+
+    var bit_x : u16 = 0;
+    var bit_y : u16 = 0;
+    plane_child_bits(child_level, &bit_x, &bit_y);
+
+    for (@range(u16, nz_parent)) |pz| {
+        const cz0 : u16 = 2 * pz;
+        const cz1 : u16 = 2 * pz + 1;
+
+        const cid0 : u16 = bit_x | (bit_y << 1) | (0 << 2);
+        const cid1 : u16 = bit_x | (bit_y << 1) | (1 << 2);
+
+        // L2L uses the SAME sign/level convention as the 3D code: harmonics of
+        // the NEGATED get_translation_vector(child_id, CHILD_level). This was
+        // validated end-to-end in 3D. (A standalone unit test for L2L needs a
+        // physical far-source field; it is deferred to the end-to-end force
+        // check against direct N-body, which is the authoritative L2L test.)
+        var t_vec = @zeros([3]f32);
+        var par = @ptrcast(*[cons.C_BUF_SIZE]f32, &parent_l.*[pz * cons.C_BUF_SIZE]);
+
+        geom.get_translation_vector(@as(u32, cid0), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child0 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_l.*[cz0 * cons.C_BUF_SIZE]);
+        kernels.l2l_translate(&v_buf, par, child0,
+            &l2l_offsets, &l2l_source_indices, &l2l_v_indices, &l2l_signs);
+
+        geom.get_translation_vector(@as(u32, cid1), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child1 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_l.*[cz1 * cons.C_BUF_SIZE]);
+        kernels.l2l_translate(&v_buf, par, child1,
+            &l2l_offsets, &l2l_source_indices, &l2l_v_indices, &l2l_signs);
+    }
+}
+
+// ===========================================================================
+// PLANE M2M / L2L EXCHANGE  (phase c, plane part)
+// ===========================================================================
+//
+// HIERARCHICAL, 4->1 per level (not all-PEs-to-rep). After the Z-local M2M
+// aggregates a PE's own column children into its m_lvl{parent} partials, the
+// plane combine merges 2x2 plane blocks into one: each representative at
+// child_level that is NOT the representative at parent_level sends its complete
+// child multipole up to the parent representative, which accumulates.
+//
+// A PE is a representative at `level` iff pe_is_plane_node(pe_x,pe_y,level).
+// hop distance of the send = cells_per_box(child_level).
+//
+// Plane M2M counters (mirror the M2L quota scheme but tiny; the upward pass is
+// a barrier before M2L). recv_expected here = number of child partials the
+// representative must receive before its parent node is complete.
+var m2m_recv_count : u32 = 0;
+var m2m_recv_expected : u32 = 0;
+var m2m_cur_level : u16 = 4;     // child_level currently combining upward
+var m2m_phase_active : u16 = 0;
+
+// Representative PE (plane) of the parent box that contains this PE at
+// parent_level. Returns (rep_x, rep_y).
+fn parent_rep_of(parent_level: u16, rep_x: *u16, rep_y: *u16) void {
+    const s : u16 = geom.cells_per_box(parent_level);
+    rep_x.* = (pe_x / s) * s;
+    rep_y.* = (pe_y / s) * s;
+}
+
+// Does this PE, a representative at child_level, need to send up (i.e. it is NOT
+// the parent representative)?
+fn needs_plane_send_up(child_level: u16) bool {
+    const parent_level = child_level - 1;
+    if (!geom.pe_is_plane_node(pe_x, pe_y, child_level)) return false;
+    // if also the parent rep, no send (it is the receiver)
+    if (geom.pe_is_plane_node(pe_x, pe_y, parent_level)) return false;
+    return true;
+}
+
+// Send this PE's complete child multipoles (m_lvl{child}) up to the parent rep.
+// One message per Z-node at child_level (nz = grid_boxes(child_level)), carrying
+// up to K cubes each. msg_type = MSG_M2M, tag encodes the planar child offset so
+// the receiver translates correctly (here the partial is already at the child
+// center; the receiver's accumulate is a plain add since we pre-translate on
+// send... see note).
+//
+// SIMPLIFICATION for plane M2M: because each PE already did its Z-local M2M into
+// the PARENT center, the partials are all expressed about the SAME parent
+// center. Combining is then a plain ADD at the representative, no translation.
+// So the message just carries the partial expansions and the receiver adds them.
+fn m2m_plane_send_up(child_level: u16) void {
+    const parent_level = child_level - 1;
+    const nz_parent : u16 = geom.grid_boxes(parent_level);
+    var rx : u16 = 0; var ry : u16 = 0;
+    parent_rep_of(parent_level, &rx, &ry);
+
+    // one message per K-group of parent Z-nodes
+    var zbase : u16 = 0;
+    while (zbase < nz_parent) {
+        var zcount : u16 = nz_parent - zbase;
+        if (zcount > cons.K_CUBES) zcount = cons.K_CUBES;
+        const header = build_header(rx, ry, cons.MSG_M2M, parent_level,
+                                    0, zcount, zbase);
+        const m = m_level_ptr(parent_level);
+        var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &m.*[zbase * cons.C_BUF_SIZE]);
+        const plen = zcount * cons.C_BUF_SIZE;
+        // block until a tx buffer is free (plane M2M is a barrier phase; simple)
+        var sent : bool = false;
+        sent = try_send(rx, ry, header, src, plen);
+        // if not sent, it will be retried by the sender poke; for the barrier we
+        // rely on tx_complete re-activation. Mark pending via m2l pending slot is
+        // overkill here; in the barrier we spin lightly.
+        while (!sent) {
+            sent = try_send(rx, ry, header, src, plen);
+        }
+        zbase += zcount;
+    }
+}
+
+// Representative accumulates a received plane M2M partial: plain ADD into its
+// m_lvl{parent} (partials already share the parent center).
+fn m2m_plane_accumulate(level: u16, zbase: u16, zcount: u16,
+                        payload: *[cons.MSG_PAYLOAD_MAX]f32) void {
+    const m = m_level_ptr(level);
+    for (@range(u16, zcount)) |ci| {
+        const node = zbase + ci;
+        const src_base = ci * cons.C_BUF_SIZE;
+        const dst_base = node * cons.C_BUF_SIZE;
+        for (@range(u16, cons.C_BUF_SIZE)) |i| {
+            m.*[dst_base + i] += payload.*[src_base + i];
+        }
+    }
+    m2m_recv_count += 1;
+}
+
+// L2L plane: the mirror. The representative sends its complete parent local
+// expansion DOWN to the other PEs of its block, which receive into l_lvl{parent}
+// (plain copy; they then do Z-local L2L to leaves). Written as send-down.
+fn l2l_plane_send_down(parent_level: u16) void {
+    // Only the representative at parent_level sends.
+    if (!geom.pe_is_plane_node(pe_x, pe_y, parent_level)) return;
+    const s : u16 = geom.cells_per_box(parent_level);
+    const nz : u16 = geom.grid_boxes(parent_level);
+    // send to the other PEs of the block (the s x s block minus self)
+    var ox : u16 = 0;
+    while (ox < s) {
+        var oy : u16 = 0;
+        while (oy < s) {
+            const tx = pe_x + ox;
+            const ty = pe_y + oy;
+            if (!(ox == 0 and oy == 0)) {
+                var zbase : u16 = 0;
+                while (zbase < nz) {
+                    var zcount : u16 = nz - zbase;
+                    if (zcount > cons.K_CUBES) zcount = cons.K_CUBES;
+                    const header = build_header(tx, ty, cons.MSG_L2L, parent_level,
+                                                0, zcount, zbase);
+                    const l = l_level_ptr(parent_level);
+                    var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &l.*[zbase * cons.C_BUF_SIZE]);
+                    const plen = zcount * cons.C_BUF_SIZE;
+                    var sent = try_send(tx, ty, header, src, plen);
+                    while (!sent) { sent = try_send(tx, ty, header, src, plen); }
+                    zbase += zcount;
+                }
+            }
+            oy += 1;
+        }
+        ox += 1;
+    }
+}
+
+// Receiver of an L2L plane message: plain copy into l_lvl{parent}.
+fn l2l_plane_receive(level: u16, zbase: u16, zcount: u16,
+                     payload: *[cons.MSG_PAYLOAD_MAX]f32) void {
+    const l = l_level_ptr(level);
+    for (@range(u16, zcount)) |ci| {
+        const node = zbase + ci;
+        const src_base = ci * cons.C_BUF_SIZE;
+        const dst_base = node * cons.C_BUF_SIZE;
+        for (@range(u16, cons.C_BUF_SIZE)) |i| {
+            l.*[dst_base + i] = payload.*[src_base + i];
+        }
+    }
+}
+
+
+// ===========================================================================
+// P2P  (phase e: near-field direct interaction)
+// ===========================================================================
+//
+// Of a leaf cell's 26 3D neighbours: 2 are Z-only (same column, LOCAL, 0 hops)
+// and 24 are toward the 8 adjacent plane PEs at 1 hop. P2P is strictly 1-hop:
+// each PE sends body-slabs to its (<=8) plane neighbours and receives from them.
+// No transit. The receiver, for each of its target cells, interacts with the
+// remote source cells whose 3D offset is within [-1,1]^3.
+//
+// Transport: reuses the M2L path (type-agnostic 32-bit moves). Bodies (x,y,z,q)
+// are bitcast to f32 to ride the fabric. Header: tag = planar (dx,dy) neighbour
+// offset, zbase = first source cell index, zcount = cells in this message.
+
+// Accumulate direct interaction of remote-neighbour bodies into local forces.
+// The remote bodies belong to cells (cbase .. cbase+ccount-1) of the neighbour
+// column at planar offset (dx,dy) given by tag. For each local target cell tz
+// and each remote source cell sz in that slab with |tz-sz|<=1, do the pairwise
+// direct sum (same planar offset, cell-center geometry handled by absolute body
+// coords which already encode position).
+fn apply_p2p_message(tag: u16, cbase: u16, ccount: u16,
+                     payload: *[cons.MSG_PAYLOAD_MAX]f32) void {
+    var dxp : i16 = 0; var dyp : i16 = 0; var dzp0 : i16 = 0;
+    geom.get_indices_from_tag(tag, &dxp, &dyp, &dzp0);  // planar neighbour offset
+
+    const local_count_offset : u16 = 2;  // bodies_col block: [count | bodies...]
+    // For each remote source cell in this slab:
+    for (@range(u16, ccount)) |si| {
+        const src_z : u16 = cbase + si;
+        // remote bodies for this cell start at si * (max_bodies*4) in payload,
+        // but we also need the remote cell's body count. We packed count into the
+        // payload as the first slot of each cell block (see p2p_send).
+        const cell_stride : u16 = 1 + max_bodies_pe * 4;
+        const rbase : u16 = si * cell_stride;
+        const rcount : u16 = @as(u16, @bitcast(u32, payload.*[rbase]));
+
+        // For each local target cell tz with |tz - src_z| <= 1:
+        var tz : u16 = 0;
+        while (tz < cells_per_side) {
+            const dz : i16 = @as(i16, tz) - @as(i16, src_z);
+            const adz : i16 = if (dz < 0) -dz else dz;
+            if (adz <= 1) {
+                // local cell tz bodies
+                const lblk : u16 = tz * CELL_BLOCK;
+                const lcount : u16 = @as(u16, bodies_col[lblk]);
+                const lbody0 : u16 = lblk + 1;
+                const fcell_base : u16 = tz * (max_bodies_pe * 4);
+                // direct sum: each local target body vs each remote source body
+                for (@range(u16, lcount)) |ti| {
+                    const ib : u16 = lbody0 + ti * 4;
+                    const tx : f32 = @bitcast(f32, bodies_col[ib]);
+                    const ty : f32 = @bitcast(f32, bodies_col[ib + 1]);
+                    const tzc : f32 = @bitcast(f32, bodies_col[ib + 2]);
+                    var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0; var pot : f32 = 0.0;
+                    for (@range(u16, rcount)) |ri| {
+                        const rb : u16 = rbase + 1 + ri * 4;
+                        const rx : f32 = payload.*[rb];
+                        const ry : f32 = payload.*[rb + 1];
+                        const rz : f32 = payload.*[rb + 2];
+                        const rq : f32 = payload.*[rb + 3];
+                        const ddx = rx - tx; const ddy = ry - ty; const ddz = rz - tzc;
+                        const r2 = ddx*ddx + ddy*ddy + ddz*ddz;
+                        if (r2 > 1e-10) {
+                            const rinv = 1.0 / math_sqrt(r2);
+                            const rinv3 = rinv * rinv * rinv;
+                            const ff = rq * rinv3;
+                            fx += ff * ddx; fy += ff * ddy; fz += ff * ddz;
+                            pot += rq * rinv;
+                        }
+                    }
+                    const fo : u16 = fcell_base + ti * 4;
+                    forces_col[fo]     += fx;
+                    forces_col[fo + 1] += fy;
+                    forces_col[fo + 2] += fz;
+                    forces_col[fo + 3] += pot;
+                }
+            }
+            tz += 1;
+        }
+    }
+}
+
+// local sqrt helper (kernels has math; expose here for P2P)
+const math_mod = @import_module("<math>");
+fn math_sqrt(x: f32) f32 { return math_mod.sqrt(x); }
+
+// Self + Z-local direct P2P: a cell interacts with its own bodies and with the
+// 2 Z-adjacent cells of the SAME column (0 hops). Done entirely in SRAM.
+fn p2p_self_and_zlocal() void {
+    var tz : u16 = 0;
+    while (tz < cells_per_side) {
+        const tblk : u16 = tz * CELL_BLOCK;
+        const tcount : u16 = @as(u16, bodies_col[tblk]);
+        const tbody0 : u16 = tblk + 1;
+        const fcell_base : u16 = tz * (max_bodies_pe * 4);
+
+        for (@range(u16, tcount)) |ti| {
+            const ib : u16 = tbody0 + ti * 4;
+            const tx : f32 = @bitcast(f32, bodies_col[ib]);
+            const ty : f32 = @bitcast(f32, bodies_col[ib + 1]);
+            const tzc : f32 = @bitcast(f32, bodies_col[ib + 2]);
+            var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0; var pot : f32 = 0.0;
+
+            // source cells: tz-1, tz, tz+1 (same column)
+            var sz : i16 = @as(i16, tz) - 1;
+            while (sz <= @as(i16, tz) + 1) {
+                if (sz >= 0 and sz < @as(i16, cells_per_side)) {
+                    const sblk : u16 = @as(u16, sz) * CELL_BLOCK;
+                    const scount : u16 = @as(u16, bodies_col[sblk]);
+                    const sbody0 : u16 = sblk + 1;
+                    for (@range(u16, scount)) |ri| {
+                        const rb : u16 = sbody0 + ri * 4;
+                        const rx : f32 = @bitcast(f32, bodies_col[rb]);
+                        const ry : f32 = @bitcast(f32, bodies_col[rb + 1]);
+                        const rz : f32 = @bitcast(f32, bodies_col[rb + 2]);
+                        const rq : f32 = @bitcast(f32, bodies_col[rb + 3]);
+                        const ddx = rx - tx; const ddy = ry - ty; const ddz = rz - tzc;
+                        const r2 = ddx*ddx + ddy*ddy + ddz*ddz;
+                        if (r2 > 1e-10) {
+                            const rinv = 1.0 / math_sqrt(r2);
+                            const rinv3 = rinv * rinv * rinv;
+                            const ff = rq * rinv3;
+                            fx += ff * ddx; fy += ff * ddy; fz += ff * ddz;
+                            pot += rq * rinv;
+                        }
+                    }
+                }
+                sz += 1;
+            }
+            const fo : u16 = fcell_base + ti * 4;
+            forces_col[fo]     += fx;
+            forces_col[fo + 1] += fy;
+            forces_col[fo + 2] += fz;
+            forces_col[fo + 3] += pot;
+        }
+        tz += 1;
+    }
+}
+
+// Send this column's body-slabs to the 8 plane neighbours (1 hop each).
+// Each message carries P2P_CELLS_PER_MSG cells' bodies (count + bodies per cell).
+fn p2p_send_to_neighbours() void {
+    // build a slab payload buffer reusing a tx path; we construct per-message.
+    var ni : u16 = 0;
+    const cell_stride : u16 = 1 + max_bodies_pe * 4;
+    // iterate 8 plane neighbour offsets
+    var dx : i16 = -1;
+    while (dx <= 1) {
+        var dy : i16 = -1;
+        while (dy <= 1) {
+            if (!(dx == 0 and dy == 0)) {
+                const tx_i : i16 = @as(i16, pe_x) + dx;
+                const ty_i : i16 = @as(i16, pe_y) + dy;
+                if (tx_i >= 0 and tx_i < @as(i16, cells_per_side) and
+                    ty_i >= 0 and ty_i < @as(i16, cells_per_side)) {
+                    const tgt_x : u16 = @as(u16, tx_i);
+                    const tgt_y : u16 = @as(u16, ty_i);
+                    const tag : u16 = geom.get_tag_from_indices(dx, dy, 0);
+                    // split the C cells into slabs of P2P_CELLS_PER_MSG
+                    var cbase : u16 = 0;
+                    while (cbase < cells_per_side) {
+                        var ccount : u16 = cells_per_side - cbase;
+                        if (ccount > P2P_CELLS_PER_MSG) ccount = P2P_CELLS_PER_MSG;
+                        // pack slab bodies into p2p_tx_slab: per cell [count|bodies]
+                        for (@range(u16, ccount)) |ci| {
+                            const src_blk : u16 = (cbase + ci) * CELL_BLOCK;
+                            const dst_blk : u16 = ci * cell_stride;
+                            // copy count + bodies (cell_stride u32 words) as f32 bits
+                            for (@range(u16, cell_stride)) |w| {
+                                p2p_tx_slab[dst_blk + w] = @bitcast(f32, bodies_col[src_blk + w]);
+                            }
+                        }
+                        const plen : u16 = ccount * cell_stride;
+                        const header = build_header(tgt_x, tgt_y, cons.MSG_P2P, 2,
+                                                    tag, ccount, cbase);
+                        var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &p2p_tx_slab[0]);
+                        var sent = try_send(tgt_x, tgt_y, header, src, plen);
+                        while (!sent) { sent = try_send(tgt_x, tgt_y, header, src, plen); }
+                        cbase += ccount;
+                    }
+                }
+            }
+            dy += 1;
+        }
+        dx += 1;
+    }
+    _ = ni;
+}
+
+fn check_p2p_done() void {
+    if (p2p_phase_active == 0) return;
+    if (p2p_recv_count >= p2p_recv_expected and l2p_done == 1) {
+        p2p_phase_active = 0;
+        simprint.fmt("({d},{d}) P2P DONE", .{pe_x, pe_y});
+        fmm_done[0] = 1;
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+
+// ===========================================================================
+// ENTRY POINTS  (host-mediated phase barriers)
+// ===========================================================================
+//
+// The FMM phases run globally in order, with a BARRIER between each. The barrier
+// is HOST-MEDIATED: each phase kernel runs this PE's work, then signals the host
+// (fmm_done + unblock_cmd_stream). The host waits for ALL PEs before launching
+// the next phase kernel. This gives a global barrier without spending colors on
+// a reduction tree.
+//
+// Sequence the host calls:
+//   init_fmm()          -> set position, clear results
+//   run_p2m()           -> build leaf multipoles (local)
+//   run_m2m_upward()    -> Z-local + plane M2M, level by level (comm)
+//   run_m2l()           -> M2L interaction (comm, the heavy phase)
+//   run_l2l_downward()  -> plane + Z-local L2L (comm)
+//   run_l2p()           -> evaluate local expansion at bodies (local)
+//   run_p2p()           -> near-field direct interaction (1-hop comm)
+//
+// NOTE (compile/sim): the comm phases (m2m/m2l/l2l/p2p) use the async transport;
+// a phase kernel must not return to the host until this PE's phase work is done,
+// which for comm phases means "all my quotas met". The simplest correct form is
+// to have the phase's completion check (e.g. check_m2l_done) call
+// phase_signal_done() when quotas are met, rather than returning immediately.
+// For phases with spin-wait sends (plane m2m/l2l, p2p) the kernel blocks until
+// its sends finish; its receives arrive via data tasks. The done-signal fires
+// from the receive-side counter reaching its expected value.
+
+fn init_position() void {
+    pe_x = pe_x_param;
+    pe_y = pe_y_param;
+    center_x = (@as(f32, pe_x) + 0.5) * cell_size;
+    center_y = (@as(f32, pe_y) + 0.5) * cell_size;
+}
+
+export fn run_p2m() void {
+    init_position();
+    simprint.fmt("({d},{d}) P2M", .{pe_x, pe_y});
+    for (@range(u16, cells_per_side * max_bodies_pe * 4)) |i| {
+        forces_col[i] = 0.0;
+    }
+    compute_p2m_column();
+    // local phase: done immediately.
+    fmm_done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+// Upward pass: for each level, Z-local M2M then plane M2M send-up. The plane
+// receive (accumulate) happens via data tasks as partials arrive. Because the
+// combine is hierarchical, we process level by level; the host barrier between
+// run_m2m_upward invocations (one per level) guarantees children finish before
+// parents. To keep it one kernel, we rely on the spin-wait sends draining and
+// the data-task receives; a per-level host barrier is the robust option if sim
+// shows races (see host loader).
+export fn run_m2m_upward() void {
+    // Listen on all four directions (armed async drains).
+    arm_all_drains();
+    // Z-local part (all levels, local, no comm).
+    m2m_z_local(4);
+    m2m_z_local(3);
+    m2m_z_local(2);
+    m2m_z_local(1);
+    // Plane part: send this PE's partials up where it is a child-rep. The
+    // receives accumulate via the MSG_M2M dispatch.
+    if (needs_plane_send_up(4)) m2m_plane_send_up(4);
+    if (needs_plane_send_up(3)) m2m_plane_send_up(3);
+    if (needs_plane_send_up(2)) m2m_plane_send_up(2);
+    if (needs_plane_send_up(1)) m2m_plane_send_up(1);
+    simprint.fmt("({d},{d}) M2M UP", .{pe_x, pe_y});
+    // NOTE (completion coordination): a representative must receive all its
+    // children's partials before this phase is globally safe to end. The host
+    // barrier (nonblock=false) returns per-PE; correct global completion for the
+    // plane receives relies on the host re-launching the next phase only after
+    // all PEs return AND all in-flight plane messages are delivered. For the
+    // tiny plane-M2M volume at <=C hops this is covered by the host barrier plus
+    // the spin-wait sends; a receive-quota gate (like M2L's) can be added here
+    // if sim shows a representative ending early.
+    fmm_done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+export fn run_m2l() void {
+    // Clear local expansions FIRST (M2L accumulates into l_lvlN); only then arm
+    // the drains, so an early-arriving message is not wiped by the clear.
+    clear_local_expansions();
+    arm_all_drains();
+    start_m2l_phase();
+    // start_m2l_phase activates the sender; completion (check_m2l_done) will
+    // signal done when all quotas (send/recv/forward) are met across all levels.
+    // (The done-signal is fired from advance_m2l_level at the final level.)
+}
+
+export fn run_l2l_downward() void {
+    // Plane L2L send-down (reps send to block), then Z-local L2L to leaves.
+    l2l_plane_send_down(0);
+    l2l_plane_send_down(1);
+    l2l_plane_send_down(2);
+    l2l_plane_send_down(3);
+    // Z-local downward: propagate each level's local expansion to its children.
+    l2l_z_local(1);
+    l2l_z_local(2);
+    l2l_z_local(3);
+    simprint.fmt("({d},{d}) L2L DOWN", .{pe_x, pe_y});
+    fmm_done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+export fn run_l2p() void {
+    // Evaluate the leaf local expansion at each body; accumulate far-field force.
+    var z : u16 = 0;
+    while (z < cells_per_side) {
+        const blk : u16 = z * CELL_BLOCK;
+        const count : u16 = @as(u16, bodies_col[blk]);
+        const body0 : u16 = blk + 1;
+        const cz : f32 = cell_center_z(z);
+        const fcell_base : u16 = z * (max_bodies_pe * 4);
+        var lexp = @ptrcast(*[cons.C_BUF_SIZE]f32, &l_lvl4[z * cons.C_BUF_SIZE]);
+        for (@range(u16, count)) |b| {
+            const ib : u16 = body0 + b * 4;
+            const bx : f32 = @bitcast(f32, bodies_col[ib]);
+            const by : f32 = @bitcast(f32, bodies_col[ib + 1]);
+            const bz : f32 = @bitcast(f32, bodies_col[ib + 2]);
+            const ddx = bx - center_x;
+            const ddy = by - center_y;
+            const ddz = bz - cz;
+            var pot : f32 = 0.0; var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0;
+            kernels.evaluate_l2p(ddx, ddy, ddz, lexp, &pot, &fx, &fy, &fz);
+            const fo : u16 = fcell_base + b * 4;
+            forces_col[fo]     += fx;
+            forces_col[fo + 1] += fy;
+            forces_col[fo + 2] += fz;
+            forces_col[fo + 3] += pot;
+        }
+        z += 1;
+    }
+    l2p_done = 1;
+    simprint.fmt("({d},{d}) L2P", .{pe_x, pe_y});
+    fmm_done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+export fn run_p2p() void {
+    p2p_phase_active = 1;
+    p2p_recv_count = 0;
+    // local self + Z-local interaction first (no comm)
+    p2p_self_and_zlocal();
+    // send body-slabs to the 8 plane neighbours; receives arrive via data tasks.
+    p2p_send_to_neighbours();
+    // done is signalled by check_p2p_done when all expected slabs arrive AND
+    // l2p_done is set. (l2p_done was set by run_l2p.)
+    check_p2p_done();
+}
+
+// --- helpers for the phase kernels ---
+fn clear_local_expansions() void {
+    for (@range(u16, NZ4 * cons.C_BUF_SIZE)) |i| { l_lvl4[i] = 0.0; }
+    for (@range(u16, NZ3 * cons.C_BUF_SIZE)) |i| { l_lvl3[i] = 0.0; }
+    for (@range(u16, NZ2 * cons.C_BUF_SIZE)) |i| { l_lvl2[i] = 0.0; }
+    for (@range(u16, NZ1 * cons.C_BUF_SIZE)) |i| { l_lvl1[i] = 0.0; }
+    for (@range(u16, NZ0 * cons.C_BUF_SIZE)) |i| { l_lvl0[i] = 0.0; }
+}
+
+// Signal the host that this PE's current comm phase is done. Called from the
+// completion checks (advance_m2l_level final step, check_p2p_done).
+fn phase_signal_done() void {
+    fmm_done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+
+// ===========================================================================
+// HOST POINTERS
+// ===========================================================================
+var ptr_bodies_col : [*]u32 = &bodies_col;
+var ptr_forces_col : [*]f32 = &forces_col;
+var ptr_fmm_done : [*]u32 = &fmm_done;
+var ptr_m_lvl4 : [*]f32 = &m_lvl4;   // exported so the host can verify P2M
+var ptr_m_lvl3 : [*]f32 = &m_lvl3;   // exported to verify Z-local M2M
+var ptr_m_lvl2 : [*]f32 = &m_lvl2;
+var ptr_m_lvl1 : [*]f32 = &m_lvl1;
+
+var ptr_m2m_offsets : [*]u16 = &m2m_offsets;
+var ptr_m2m_child_indices : [*]u16 = &m2m_child_indices;
+var ptr_m2m_v_indices : [*]u16 = &m2m_v_indices;
+var ptr_m2m_signs : [*]u32 = &m2m_signs;
+
+var ptr_m2l_offsets : [*]u16 = &m2l_offsets;
+var ptr_m2l_source_indices : [*]u16 = &m2l_source_indices;
+var ptr_m2l_v_indices : [*]u16 = &m2l_v_indices;
+var ptr_m2l_signs : [*]u32 = &m2l_signs;
+
+var ptr_l2l_offsets : [*]u16 = &l2l_offsets;
+var ptr_l2l_source_indices : [*]u16 = &l2l_source_indices;
+var ptr_l2l_v_indices : [*]u16 = &l2l_v_indices;
+var ptr_l2l_signs : [*]u32 = &l2l_signs;
+
+var ptr_m2l_agenda_lvl2 : [*]u32 = &m2l_agenda_lvl2;
+var ptr_m2l_agenda_lvl3 : [*]u32 = &m2l_agenda_lvl3;
+var ptr_m2l_agenda_lvl4 : [*]u32 = &m2l_agenda_lvl4;
+var ptr_num_send_lvl2 : [*]u32 = &num_send_lvl2;
+var ptr_num_send_lvl3 : [*]u32 = &num_send_lvl3;
+var ptr_num_send_lvl4 : [*]u32 = &num_send_lvl4;
+var ptr_recv_expected_lvl2 : [*]u32 = &recv_expected_lvl2;
+var ptr_recv_expected_lvl3 : [*]u32 = &recv_expected_lvl3;
+var ptr_recv_expected_lvl4 : [*]u32 = &recv_expected_lvl4;
+var ptr_fwd_expected_lvl2 : [*]u32 = &fwd_expected_lvl2;
+var ptr_fwd_expected_lvl3 : [*]u32 = &fwd_expected_lvl3;
+var ptr_fwd_expected_lvl4 : [*]u32 = &fwd_expected_lvl4;
+
+
+// ===========================================================================
+// COMPTIME
+// ===========================================================================
+comptime {
+    // --- Fabric routes (per-PE, set here with the parity params) ------------
+    // Software forwarding => only RAMP<->neighbor routes, no pass-through. Each
+    // color routes either RAMP->dir (this PE sends on it) or dir->RAMP (this PE
+    // receives on it). Parity makes adjacent PEs agree on the physical color.
+    if (parity_x == 0) {
+        @set_local_color_config(c_e_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ EAST } } });
+        @set_local_color_config(c_w_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ WEST } } });
+        @set_local_color_config(c_e_in,  .{ .routes = .{ .rx = .{ WEST },  .tx = .{ RAMP } } });
+        @set_local_color_config(c_w_in,  .{ .routes = .{ .rx = .{ EAST },  .tx = .{ RAMP } } });
+    } else {
+        @set_local_color_config(c_e_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ EAST } } });
+        @set_local_color_config(c_w_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ WEST } } });
+        @set_local_color_config(c_e_in,  .{ .routes = .{ .rx = .{ WEST },  .tx = .{ RAMP } } });
+        @set_local_color_config(c_w_in,  .{ .routes = .{ .rx = .{ EAST },  .tx = .{ RAMP } } });
+    }
+    if (parity_y == 0) {
+        @set_local_color_config(c_n_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ NORTH } } });
+        @set_local_color_config(c_s_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ SOUTH } } });
+        @set_local_color_config(c_n_in,  .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+        @set_local_color_config(c_s_in,  .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+    } else {
+        @set_local_color_config(c_n_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ NORTH } } });
+        @set_local_color_config(c_s_out, .{ .routes = .{ .rx = .{ RAMP },  .tx = .{ SOUTH } } });
+        @set_local_color_config(c_n_in,  .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+        @set_local_color_config(c_s_in,  .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+    }
+
+    // --- Queue init (arch-guarded), color bound to each queue ---------------
+    if (@is_arch("wse3")) {
+        @initialize_queue(cons.e_iq, .{ .color = c_e_in });
+        @initialize_queue(cons.w_iq, .{ .color = c_w_in });
+        @initialize_queue(cons.n_iq, .{ .color = c_n_in });
+        @initialize_queue(cons.s_iq, .{ .color = c_s_in });
+        @initialize_queue(cons.e_oq, .{ .color = c_e_out });
+        @initialize_queue(cons.w_oq, .{ .color = c_w_out });
+        @initialize_queue(cons.n_oq, .{ .color = c_n_out });
+        @initialize_queue(cons.s_oq, .{ .color = c_s_out });
+    }
+
+    // --- RX completion tasks (local; fired by the async drain @mov32) -------
+    @bind_local_task(rx_complete_e, cons.rx_complete_e_id);
+    @bind_local_task(rx_complete_w, cons.rx_complete_w_id);
+    @bind_local_task(rx_complete_n, cons.rx_complete_n_id);
+    @bind_local_task(rx_complete_s, cons.rx_complete_s_id);
+
+    // --- TX completion tasks ------------------------------------------------
+    @bind_local_task(tx_complete_e, cons.tx_complete_e_id);
+    @bind_local_task(tx_complete_w, cons.tx_complete_w_id);
+    @bind_local_task(tx_complete_n, cons.tx_complete_n_id);
+    @bind_local_task(tx_complete_s, cons.tx_complete_s_id);
+
+    // M2L sender driver.
+    @bind_local_task(m2l_send_task, cons.m2l_send_task_id);
+
+    @export_symbol(ptr_bodies_col, "ptr_bodies_col");
+    @export_symbol(ptr_forces_col, "ptr_forces_col");
+    @export_symbol(ptr_fmm_done, "ptr_fmm_done");
+    @export_symbol(ptr_m_lvl4, "ptr_m_lvl4");
+    @export_symbol(ptr_m_lvl3, "ptr_m_lvl3");
+    @export_symbol(ptr_m_lvl2, "ptr_m_lvl2");
+    @export_symbol(ptr_m_lvl1, "ptr_m_lvl1");
+    @export_symbol(run_p2m, "run_p2m");
+    @export_symbol(run_m2m_upward, "run_m2m_upward");
+    @export_symbol(run_m2l, "run_m2l");
+    @export_symbol(run_l2l_downward, "run_l2l_downward");
+    @export_symbol(run_l2p, "run_l2p");
+    @export_symbol(run_p2p, "run_p2p");
+
+    @export_symbol(ptr_m2m_offsets, "ptr_m2m_offsets");
+    @export_symbol(ptr_m2m_child_indices, "ptr_m2m_child_indices");
+    @export_symbol(ptr_m2m_v_indices, "ptr_m2m_v_indices");
+    @export_symbol(ptr_m2m_signs, "ptr_m2m_signs");
+
+    @export_symbol(ptr_m2l_offsets, "ptr_m2l_offsets");
+    @export_symbol(ptr_m2l_source_indices, "ptr_m2l_source_indices");
+    @export_symbol(ptr_m2l_v_indices, "ptr_m2l_v_indices");
+    @export_symbol(ptr_m2l_signs, "ptr_m2l_signs");
+
+    @export_symbol(ptr_l2l_offsets, "ptr_l2l_offsets");
+    @export_symbol(ptr_l2l_source_indices, "ptr_l2l_source_indices");
+    @export_symbol(ptr_l2l_v_indices, "ptr_l2l_v_indices");
+    @export_symbol(ptr_l2l_signs, "ptr_l2l_signs");
+
+    @export_symbol(ptr_m2l_agenda_lvl2, "ptr_m2l_agenda_lvl2");
+    @export_symbol(ptr_m2l_agenda_lvl3, "ptr_m2l_agenda_lvl3");
+    @export_symbol(ptr_m2l_agenda_lvl4, "ptr_m2l_agenda_lvl4");
+    @export_symbol(ptr_num_send_lvl2, "ptr_num_send_lvl2");
+    @export_symbol(ptr_num_send_lvl3, "ptr_num_send_lvl3");
+    @export_symbol(ptr_num_send_lvl4, "ptr_num_send_lvl4");
+    @export_symbol(ptr_recv_expected_lvl2, "ptr_recv_expected_lvl2");
+    @export_symbol(ptr_recv_expected_lvl3, "ptr_recv_expected_lvl3");
+    @export_symbol(ptr_recv_expected_lvl4, "ptr_recv_expected_lvl4");
+    @export_symbol(ptr_fwd_expected_lvl2, "ptr_fwd_expected_lvl2");
+    @export_symbol(ptr_fwd_expected_lvl3, "ptr_fwd_expected_lvl3");
+    @export_symbol(ptr_fwd_expected_lvl4, "ptr_fwd_expected_lvl4");
+}

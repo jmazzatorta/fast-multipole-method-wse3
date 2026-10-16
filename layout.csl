@@ -1,0 +1,123 @@
+// layout.csl - 2.5D FMM, TOP-LEVEL LAYOUT (the root)
+//
+// Instantiates the C x C PE mesh (NO Morton, NO 64x64 blow-up). Each PE(x,y) is
+// a plane position hosting a column of C cells along Z. Assigns the 8 routing
+// colors (4 directions x 2 parity) with dimension-order XY fabric routes, and
+// exports the symbols the host memcpy's into each PE.
+//
+// Forwarding is SOFTWARE (store-and-forward in the PE core), so the fabric needs
+// no pass-through routes: every color is either RAMP->dir (a PE originating onto
+// it) or dir->RAMP (a PE receiving from it). The even/odd parity split makes
+// sender and receiver agree on the physical color for each hop.
+
+// --- Domain / mesh parameters ---
+param cells_per_side : u16;             // C (compile-time param; appears in out.json)
+const prob_range     : f32 = 512.0;     // physical domain edge
+param max_bodies_pe : u16;              // max bodies per leaf cell
+const cell_size : f32 = prob_range / @as(f32, cells_per_side);
+
+// --- Memcpy streaming colors (host <-> device) ---
+param MEMCPY_H2D_ID : i16;
+param MEMCPY_D2H_ID : i16;
+
+// --- Mesh side = C (direct, no Morton) ---
+const mesh_side : u16 = cells_per_side;   // 16
+
+// --- Routing colors (8) ---
+const color_E_even = @get_color(3);
+const color_E_odd  = @get_color(4);
+const color_W_even = @get_color(5);
+const color_W_odd  = @get_color(6);
+const color_N_even = @get_color(7);
+const color_N_odd  = @get_color(8);
+const color_S_even = @get_color(9);
+const color_S_odd  = @get_color(10);
+
+// --- Memcpy colors / module ---
+const color_memcpy_h2d = @get_color(MEMCPY_H2D_ID);
+const color_memcpy_d2h = @get_color(MEMCPY_D2H_ID);
+
+const memcpy_mod = @import_module("<memcpy/get_params>", .{
+    .width  = mesh_side,
+    .height = mesh_side,
+    .MEMCPYH2D_1 = color_memcpy_h2d,
+    .MEMCPYD2H_1 = color_memcpy_d2h,
+});
+
+layout {
+    @set_rectangle(mesh_side, mesh_side);
+
+    const common = .{
+        .cells_per_side = cells_per_side,
+        .prob_range = prob_range,
+        .max_bodies_pe = max_bodies_pe,
+        .cell_size = cell_size,
+        .color_e_even = color_E_even, .color_e_odd = color_E_odd,
+        .color_w_even = color_W_even, .color_w_odd = color_W_odd,
+        .color_n_even = color_N_even, .color_n_odd = color_N_odd,
+        .color_s_even = color_S_even, .color_s_odd = color_S_odd,
+    };
+
+    // --- Assign per-PE code: pe_x/pe_y are the DIRECT plane coordinates ---
+    for (@range(u16, mesh_side)) |pe_y| {
+        for (@range(u16, mesh_side)) |pe_x| {
+            @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(common, .{
+                .pe_x_param = pe_x,
+                .pe_y_param = pe_y,
+                .parity_x = pe_x % 2,
+                .parity_y = pe_y % 2,
+                .memcpy_params = memcpy_mod.get_params(pe_x),
+            }));
+        }
+    }
+
+    // Fabric routes are set per-PE INSIDE pe.csl's comptime block (using the
+    // parity params), following the working WSE-3 reference pattern with
+    // @set_local_color_config. Nothing to configure here at the layout level.
+
+    // --- Exported phase entry points (host calls in sequence, barriers between) ---
+    @export_name("run_p2m", fn()void);
+    @export_name("run_m2m_upward", fn()void);
+    @export_name("run_m2l", fn()void);
+    @export_name("run_l2l_downward", fn()void);
+    @export_name("run_l2p", fn()void);
+    @export_name("run_p2p", fn()void);
+
+    @export_name("ptr_fmm_done", [*]u32, true);
+
+    @export_name("ptr_bodies_col", [*]u32, true);
+    @export_name("ptr_forces_col", [*]f32, true);
+
+    @export_name("ptr_m_lvl4", [*]f32, true);
+    @export_name("ptr_m_lvl3", [*]f32, true);
+    @export_name("ptr_m_lvl2", [*]f32, true);
+    @export_name("ptr_m_lvl1", [*]f32, true);
+
+    @export_name("ptr_m2m_offsets", [*]u16, true);
+    @export_name("ptr_m2m_child_indices", [*]u16, true);
+    @export_name("ptr_m2m_v_indices", [*]u16, true);
+    @export_name("ptr_m2m_signs", [*]u32, true);
+
+    @export_name("ptr_m2l_offsets", [*]u16, true);
+    @export_name("ptr_m2l_source_indices", [*]u16, true);
+    @export_name("ptr_m2l_v_indices", [*]u16, true);
+    @export_name("ptr_m2l_signs", [*]u32, true);
+
+    @export_name("ptr_l2l_offsets", [*]u16, true);
+    @export_name("ptr_l2l_source_indices", [*]u16, true);
+    @export_name("ptr_l2l_v_indices", [*]u16, true);
+    @export_name("ptr_l2l_signs", [*]u32, true);
+
+    @export_name("ptr_m2l_agenda_lvl2", [*]u32, true);
+    @export_name("ptr_m2l_agenda_lvl3", [*]u32, true);
+    @export_name("ptr_m2l_agenda_lvl4", [*]u32, true);
+    @export_name("ptr_num_send_lvl2", [*]u32, true);
+    @export_name("ptr_num_send_lvl3", [*]u32, true);
+    @export_name("ptr_num_send_lvl4", [*]u32, true);
+    @export_name("ptr_recv_expected_lvl2", [*]u32, true);
+    @export_name("ptr_recv_expected_lvl3", [*]u32, true);
+    @export_name("ptr_recv_expected_lvl4", [*]u32, true);
+    @export_name("ptr_fwd_expected_lvl2", [*]u32, true);
+    @export_name("ptr_fwd_expected_lvl3", [*]u32, true);
+    @export_name("ptr_fwd_expected_lvl4", [*]u32, true);
+}
