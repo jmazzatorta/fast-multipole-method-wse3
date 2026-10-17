@@ -36,7 +36,7 @@ import numpy as np
 from cerebras.sdk.client import SdkRuntime
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
-DATA_FILE = "tables/fmm25d_data.pkl"
+DATA_FILE = "fmm25d_data.pkl"
 FLOATS_PER_BODY = 4
 
 
@@ -302,7 +302,20 @@ def main():
 
     print("[2/4] Packing M2L agendas/quotas per level...")
     levels = [2, 3, 4]
-    packed = {lv: pack_m2l_level(routing, C, lv, args.max_agenda) for lv in levels}
+    # Per-level agenda bound, matching constants.csl exactly:
+    #   bound(L) = M2L_MAX_DESTS * ceil( (C / 2**(TREE_H-L)) / K_CUBES )
+    # i.e. 48 * ceil(nz_at_level / K). TREE_H = log2(C). For C=16,K=4:
+    #   L4 -> 192, L3 -> 96, L2 -> 48.
+    K_CUBES = int(d["params"]["K_CUBES"])
+    M2L_MAX_DESTS = 48
+    TREE_H = C.bit_length() - 1  # log2(C)
+    def agenda_bound(level):
+        nz = C // (2 ** (TREE_H - level))   # cubes along Z in a box at this level
+        msgs = (nz + K_CUBES - 1) // K_CUBES
+        return M2L_MAX_DESTS * msgs
+    agenda_sz = {lv: agenda_bound(lv) for lv in levels}
+    print(f"       per-level agenda bounds: {agenda_sz}")
+    packed = {lv: pack_m2l_level(routing, C, lv, agenda_sz[lv]) for lv in levels}
 
     err = None
     forces_3d = None
@@ -346,7 +359,7 @@ def main():
             # agendas + quotas (per-PE)
             for lv in levels:
                 a3d, nsend, nrecv, nfwd = packed[lv]
-                h2d_per_pe_u32(runner, sym[f"agenda{lv}"], a3d, side, args.max_agenda)
+                h2d_per_pe_u32(runner, sym[f"agenda{lv}"], a3d, side, agenda_sz[lv])
                 h2d_per_pe_u32(runner, sym[f"nsend{lv}"], nsend, side, 1)
                 h2d_per_pe_u32(runner, sym[f"nrecv{lv}"], nrecv, side, 1)
                 h2d_per_pe_u32(runner, sym[f"nfwd{lv}"],  nfwd,  side, 1)

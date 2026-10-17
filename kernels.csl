@@ -329,8 +329,10 @@ fn l2l_translate(
 fn lm_index(l: i16, m: i16) u16 {
     var pos: u16 = 0;
     var mm: i16 = 0;
+    const Pi: i16 = @as(i16, P);
     while (mm < m) {
-        pos += @as(u16, P + 1 - mm);
+        // All operands in i16 to avoid a u16/i16 mix; result is always >= 1.
+        pos += @as(u16, Pi + 1 - mm);
         mm += 1;
     }
     pos += @as(u16, l - m);

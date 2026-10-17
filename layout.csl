@@ -33,41 +33,36 @@ const color_N_odd  = @get_color(8);
 const color_S_even = @get_color(9);
 const color_S_odd  = @get_color(10);
 
-// --- Memcpy colors / module ---
-const color_memcpy_h2d = @get_color(MEMCPY_H2D_ID);
-const color_memcpy_d2h = @get_color(MEMCPY_D2H_ID);
-
+// --- Memcpy module: pass the H2D/D2H color IDs (i16) directly, not @get_color ---
 const memcpy_mod = @import_module("<memcpy/get_params>", .{
     .width  = mesh_side,
     .height = mesh_side,
-    .MEMCPYH2D_1 = color_memcpy_h2d,
-    .MEMCPYD2H_1 = color_memcpy_d2h,
+    .MEMCPYH2D_1 = MEMCPY_H2D_ID,
+    .MEMCPYD2H_1 = MEMCPY_D2H_ID,
 });
 
 layout {
     @set_rectangle(mesh_side, mesh_side);
 
-    const common = .{
-        .cells_per_side = cells_per_side,
-        .prob_range = prob_range,
-        .max_bodies_pe = max_bodies_pe,
-        .cell_size = cell_size,
-        .color_e_even = color_E_even, .color_e_odd = color_E_odd,
-        .color_w_even = color_W_even, .color_w_odd = color_W_odd,
-        .color_n_even = color_N_even, .color_n_odd = color_N_odd,
-        .color_s_even = color_S_even, .color_s_odd = color_S_odd,
-    };
-
     // --- Assign per-PE code: pe_x/pe_y are the DIRECT plane coordinates ---
+    // All params passed in one struct literal (no @concat_structs in this CSL).
     for (@range(u16, mesh_side)) |pe_y| {
         for (@range(u16, mesh_side)) |pe_x| {
-            @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(common, .{
+            @set_tile_code(pe_x, pe_y, "pe.csl", .{
+                .cells_per_side = cells_per_side,
+                .prob_range = prob_range,
+                .max_bodies_pe = max_bodies_pe,
+                .cell_size = cell_size,
+                .color_e_even = color_E_even, .color_e_odd = color_E_odd,
+                .color_w_even = color_W_even, .color_w_odd = color_W_odd,
+                .color_n_even = color_N_even, .color_n_odd = color_N_odd,
+                .color_s_even = color_S_even, .color_s_odd = color_S_odd,
                 .pe_x_param = pe_x,
                 .pe_y_param = pe_y,
                 .parity_x = pe_x % 2,
                 .parity_y = pe_y % 2,
                 .memcpy_params = memcpy_mod.get_params(pe_x),
-            }));
+            });
         }
     }
 
@@ -88,10 +83,10 @@ layout {
     @export_name("ptr_bodies_col", [*]u32, true);
     @export_name("ptr_forces_col", [*]f32, true);
 
-    @export_name("ptr_m_lvl4", [*]f32, true);
-    @export_name("ptr_m_lvl3", [*]f32, true);
-    @export_name("ptr_m_lvl2", [*]f32, true);
-    @export_name("ptr_m_lvl1", [*]f32, true);
+    // NOTE: ptr_m_lvl* intermediate-multipole exports removed. They were only
+    // used for P2M/M2M host verification and are not read by the runner; keeping
+    // them pinned symbols and pointer globals that pressured .data.hi / the
+    // symbol table. The buffers remain as plain `var` in pe.csl.
 
     @export_name("ptr_m2m_offsets", [*]u16, true);
     @export_name("ptr_m2m_child_indices", [*]u16, true);

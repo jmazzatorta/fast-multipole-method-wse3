@@ -23,10 +23,12 @@
 //   level 0 (root): 1   node    -> m_lvl0 / l_lvl0
 // Total 2C-1 M nodes + 2C-1 L nodes = 7.27 KB at P=4, C=16.
 
-param memcpy_params : comptime_struct;
-const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
-
 const simprint = @import_module("<simprint>");
+
+// memcpy params struct from the layout. Declared untyped: the `comptime_struct`
+// type annotation is not accepted by the current cslc (server 1.20.2).
+param memcpy_params;
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
 // --- GLOBAL PARAMETERS (from layout) ---
 param cells_per_side : u16;   // C
@@ -111,9 +113,12 @@ export var l2l_signs          = @zeros([cons.L2L_N_ENTRIES]u32);
 // a u32 header-like word (tgt_x,tgt_y,tag,zbase,zcount) built by the generator
 // with the same field layout as the runtime header (minus msg_type/level, which
 // are known from the phase). num_send_lvlN = number of valid entries.
-export var m2l_agenda_lvl2 = @zeros([cons.MAX_AGENDA]u32);
-export var m2l_agenda_lvl3 = @zeros([cons.MAX_AGENDA]u32);
-export var m2l_agenda_lvl4 = @zeros([cons.MAX_AGENDA]u32);
+// Per-level sizing: each buffer only ever holds its own level's entries, so we
+// size each to its geometric upper bound (see constants.csl) rather than a
+// single generous MAX_AGENDA. Saves per-PE .bss with no behavior change.
+export var m2l_agenda_lvl2 = @zeros([cons.MAX_AGENDA_L2]u32);
+export var m2l_agenda_lvl3 = @zeros([cons.MAX_AGENDA_L3]u32);
+export var m2l_agenda_lvl4 = @zeros([cons.MAX_AGENDA_L4]u32);
 export var num_send_lvl2 = @zeros([1]u32);
 export var num_send_lvl3 = @zeros([1]u32);
 export var num_send_lvl4 = @zeros([1]u32);
@@ -176,11 +181,13 @@ const NZ1 : u16 = cells_per_side / 8;      // 2
 const NZ0 : u16 = 1;                       // 1
 
 // Multipole (M) buffers, upward pass. m_lvl4 is the P2M output.
-export var m_lvl4 = @zeros([NZ4 * cons.C_BUF_SIZE]f32);
-export var m_lvl3 = @zeros([NZ3 * cons.C_BUF_SIZE]f32);
-export var m_lvl2 = @zeros([NZ2 * cons.C_BUF_SIZE]f32);
-export var m_lvl1 = @zeros([NZ1 * cons.C_BUF_SIZE]f32);
-export var m_lvl0 = @zeros([NZ0 * cons.C_BUF_SIZE]f32);
+// Not exported: host verification of intermediate multipoles was dropped to
+// relieve per-PE code/symbol-table pressure (see layout.csl).
+var m_lvl4 = @zeros([NZ4 * cons.C_BUF_SIZE]f32);
+var m_lvl3 = @zeros([NZ3 * cons.C_BUF_SIZE]f32);
+var m_lvl2 = @zeros([NZ2 * cons.C_BUF_SIZE]f32);
+var m_lvl1 = @zeros([NZ1 * cons.C_BUF_SIZE]f32);
+var m_lvl0 = @zeros([NZ0 * cons.C_BUF_SIZE]f32);
 
 // Local (L) buffers, downward pass. Filled in phases (c)/(d).
 var l_lvl4 = @zeros([NZ4 * cons.C_BUF_SIZE]f32);
@@ -320,7 +327,10 @@ fn tx_launch(dir: u16, slot_base: u16, header: u32,
         var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
         d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_e[slot_base + 1]));
         const dl = @set_dsd_length(d, plen);
-        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        // Source DSD: build over a named array, then rebase to the `src` pointer.
+        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
+        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
+        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
         const sl = @set_dsd_length(s, plen);
         @fmovs(dl, sl);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_e[i] });
@@ -331,7 +341,10 @@ fn tx_launch(dir: u16, slot_base: u16, header: u32,
         var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_w[i] });
         d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_w[slot_base + 1]));
         const dl = @set_dsd_length(d, plen);
-        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        // Source DSD: build over a named array, then rebase to the `src` pointer.
+        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
+        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_w[i] });
+        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
         const sl = @set_dsd_length(s, plen);
         @fmovs(dl, sl);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_w[i] });
@@ -342,7 +355,10 @@ fn tx_launch(dir: u16, slot_base: u16, header: u32,
         var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_n[i] });
         d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_n[slot_base + 1]));
         const dl = @set_dsd_length(d, plen);
-        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        // Source DSD: build over a named array, then rebase to the `src` pointer.
+        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
+        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_n[i] });
+        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
         const sl = @set_dsd_length(s, plen);
         @fmovs(dl, sl);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_n[i] });
@@ -353,7 +369,10 @@ fn tx_launch(dir: u16, slot_base: u16, header: u32,
         var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_s[i] });
         d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_s[slot_base + 1]));
         const dl = @set_dsd_length(d, plen);
-        const s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> src.*[i] });
+        // Source DSD: build over a named array, then rebase to the `src` pointer.
+        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
+        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_s[i] });
+        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
         const sl = @set_dsd_length(s, plen);
         @fmovs(dl, sl);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_s[i] });
@@ -1253,7 +1272,6 @@ fn p2p_self_and_zlocal() void {
 // Each message carries P2P_CELLS_PER_MSG cells' bodies (count + bodies per cell).
 fn p2p_send_to_neighbours() void {
     // build a slab payload buffer reusing a tx path; we construct per-message.
-    var ni : u16 = 0;
     const cell_stride : u16 = 1 + max_bodies_pe * 4;
     // iterate 8 plane neighbour offsets
     var dx : i16 = -1;
@@ -1296,7 +1314,6 @@ fn p2p_send_to_neighbours() void {
         }
         dx += 1;
     }
-    _ = ni;
 }
 
 fn check_p2p_done() void {
@@ -1486,10 +1503,6 @@ fn phase_signal_done() void {
 var ptr_bodies_col : [*]u32 = &bodies_col;
 var ptr_forces_col : [*]f32 = &forces_col;
 var ptr_fmm_done : [*]u32 = &fmm_done;
-var ptr_m_lvl4 : [*]f32 = &m_lvl4;   // exported so the host can verify P2M
-var ptr_m_lvl3 : [*]f32 = &m_lvl3;   // exported to verify Z-local M2M
-var ptr_m_lvl2 : [*]f32 = &m_lvl2;
-var ptr_m_lvl1 : [*]f32 = &m_lvl1;
 
 var ptr_m2m_offsets : [*]u16 = &m2m_offsets;
 var ptr_m2m_child_indices : [*]u16 = &m2m_child_indices;
@@ -1581,10 +1594,6 @@ comptime {
     @export_symbol(ptr_bodies_col, "ptr_bodies_col");
     @export_symbol(ptr_forces_col, "ptr_forces_col");
     @export_symbol(ptr_fmm_done, "ptr_fmm_done");
-    @export_symbol(ptr_m_lvl4, "ptr_m_lvl4");
-    @export_symbol(ptr_m_lvl3, "ptr_m_lvl3");
-    @export_symbol(ptr_m_lvl2, "ptr_m_lvl2");
-    @export_symbol(ptr_m_lvl1, "ptr_m_lvl1");
     @export_symbol(run_p2m, "run_p2m");
     @export_symbol(run_m2m_upward, "run_m2m_upward");
     @export_symbol(run_m2l, "run_m2l");

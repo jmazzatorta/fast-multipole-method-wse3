@@ -90,7 +90,12 @@ def main():
         f"--params=max_bodies_pe:{args.max_bodies_pe} "
         f"--params=MEMCPY_H2D_ID:0 "
         f"--params=MEMCPY_D2H_ID:1 "
-        f"--max-inlined-iterations 500 "
+        # Loop-unroll budget. 500 fully unrolls the big FMM loops (M2L 375,
+        # M2M/L2L 92) and blows past per-PE code memory; 1 is too low for the
+        # system libraries (simprint's inline byte loop needs a few). 16 lets the
+        # short library loops unroll while the large FMM loops (>16) stay as real
+        # loops, keeping .text/.data.hi small.
+        f"--max-inlined-iterations 16 "
         f"-o out --memcpy --channels 1"
     )
 

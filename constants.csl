@@ -172,10 +172,28 @@ const s_oq = @get_output_queue(5);
 // -> the rx buffer frees -> no permanent block. This removes the 3D FWD FIFO.
 const NBUF : u16 = 2;
 
-// --- Agenda bound -------------------------------------------------------
-// Per-PE M2L agenda: <=48 distinct remote (X,Y) destinations; with K-splitting
-// the leaf level issues up to 4 messages per destination. Bound generously.
-const MAX_AGENDA : u16 = 256;
+// --- Agenda bounds (per level) ------------------------------------------
+// Per-PE M2L agenda size = (max distinct plane destinations) * (messages per
+// destination after K-splitting along Z). The planar M2L interaction list has
+// at most 48 distinct (X,Y) destinations. A box at level L stacks
+// nz = C / 2**L cubes along Z, split into ceil(nz / K_CUBES) messages each.
+// This is a geometric UPPER BOUND (destination-count independent of the body
+// distribution), so it is safe for any input and stays C-generic.
+//
+//   level 4 (leaf): nz = C    -> ceil(C/K)   msgs/dest
+//   level 3       : nz = C/2  -> ceil(C/2/K) msgs/dest
+//   level 2       : nz = C/4  -> ceil(C/4/K) msgs/dest
+//
+// For C=16, K=4: lvl4 = 48*4 = 192, lvl3 = 48*2 = 96, lvl2 = 48*1 = 48.
+const M2L_MAX_DESTS : u16 = 48;
+fn msgs_per_dest(nz: u16) u16 { return (nz + K_CUBES - 1) / K_CUBES; }
+
+const MAX_AGENDA_L4 : u16 = M2L_MAX_DESTS * msgs_per_dest(cells_per_side);
+const MAX_AGENDA_L3 : u16 = M2L_MAX_DESTS * msgs_per_dest(cells_per_side / 2);
+const MAX_AGENDA_L2 : u16 = M2L_MAX_DESTS * msgs_per_dest(cells_per_side / 4);
+
+// Max over all levels, for any single-buffer or worst-case sizing needs.
+const MAX_AGENDA : u16 = MAX_AGENDA_L4;
 
 // --- P2P neighbours ------------------------------------------------------
 // On the plane the 24 planar 3D-neighbours reduce to the 8 adjacent plane PEs
@@ -189,10 +207,13 @@ const MAX_P2P_PLANE : u16 = 8;
 // Receive model: NO data tasks. Receive is an explicit async @mov32 drain that
 // activates a completion LOCAL task per direction. One tx-completion local task
 // per direction fires when an async send finishes (frees a tx buffer).
-const rx_complete_e_id : local_task_id = @get_local_task_id(18);
-const rx_complete_w_id : local_task_id = @get_local_task_id(19);
-const rx_complete_n_id : local_task_id = @get_local_task_id(20);
-const rx_complete_s_id : local_task_id = @get_local_task_id(21);
+// Local task IDs 16..21 are reserved by the memcpy library (e.g. ID 21 is
+// LOCAL_MEMCPYD2H_DATA). The working reference straddles that block, placing its
+// own tasks at <=15 and >=22. We keep rx_complete in the low, clear range.
+const rx_complete_e_id : local_task_id = @get_local_task_id(8);
+const rx_complete_w_id : local_task_id = @get_local_task_id(9);
+const rx_complete_n_id : local_task_id = @get_local_task_id(10);
+const rx_complete_s_id : local_task_id = @get_local_task_id(11);
 
 const tx_complete_e_id : local_task_id = @get_local_task_id(22);
 const tx_complete_w_id : local_task_id = @get_local_task_id(23);
