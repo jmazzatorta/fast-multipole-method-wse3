@@ -99,9 +99,11 @@ const MSG_P2P : u16 = 3;
 // A plane message carries K source-cube expansions (Z-cubes of the source
 // column bound for one destination plane column). Levels with more than K cubes
 // along Z split into ceil(nz/K) messages; levels with nz<=K send in one.
-//   leaf (nz=16): 4 messages   level3 (nz=8): 2   level2 (nz=4): 1   ...
-// K=4 keeps messages small (fast buffer turnover, fine-grained flow control)
-// while fitting comfortably in memory (~23 KB free for code at C=16).
+//   K=4: leaf (nz=16): 4 messages  level3 (nz=8): 2  level2 (nz=4): 1
+// K=4 restored (the .text loop refactor freed enough code space to afford the
+// larger messages again). MSG_SIZE = 4*30+1 = 121. zcount fits in 3 bits (max
+// 4 <= 7). The generator must be run with K_CUBES=4 so agendas/quotas match;
+// MAX_AGENDA_L* below track K automatically.
 const K_CUBES : u16 = 4;
 
 // --- Header layout (32 bits) --------------------------------------------
@@ -170,7 +172,14 @@ const s_oq = @get_output_queue(5);
 // none is free it waits in the rx buffer it arrived in. Under XY acyclic
 // routing a downstream PE always drains, so a tx buffer always eventually frees
 // -> the rx buffer frees -> no permanent block. This removes the 3D FWD FIFO.
-const NBUF : u16 = 2;
+const NBUF : u16 = 2;        // tx depth: double-buffered sends (pipelining kept)
+
+// RX depth separate from tx. Set to 1 to trim per-PE .bss: a single receive
+// buffer per direction. The armed-drain model receives -> handles/forwards ->
+// re-arms; with 1 buffer the fabric's hardware input queue absorbs the next
+// arrival while we process. XY acyclic routing keeps this deadlock-free (a
+// downstream PE always drains, so the single rx buffer always frees).
+const NBUF_RX : u16 = 1;
 
 // --- Agenda bounds (per level) ------------------------------------------
 // Per-PE M2L agenda size = (max distinct plane destinations) * (messages per
@@ -222,3 +231,15 @@ const tx_complete_s_id : local_task_id = @get_local_task_id(25);
 
 // Sender driver: originates this PE's own M2L messages into tx-buffer slack.
 const m2l_send_task_id : local_task_id = @get_local_task_id(14);
+
+// FIFO drain: a SINGLE task drains all four per-direction FIFOs (four separate
+// tasks overflowed the PE task table). The per-direction FIFO separation that
+// breaks the head-to-head deadlock is in the buffers, not the task count.
+const fifo_drain_task_id : local_task_id = @get_local_task_id(12);
+
+// Transit FIFO depth (whole messages) per outgoing direction. The FIFO
+// decouples receive from forward: an arriving transit message is copied into
+// its out-direction FIFO and the rx drain is re-armed immediately, so a message
+// awaiting forward never blocks the receive side. Backpressure (not re-arming rx
+// when the FIFO is full) handles bursts beyond the depth.
+const FWD_FIFO_DEPTH : u16 = 2;

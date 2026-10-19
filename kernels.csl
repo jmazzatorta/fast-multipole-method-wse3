@@ -175,150 +175,52 @@ fn compute_solid_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f
 // already brought the source expansion into local SRAM (via a plane exchange);
 // the accumulation here is identical to 3D.
 
-fn m2m_translate(
-    v_buf: *[C_BUF_SIZE]f32,
-    child_buf: *[C_BUF_SIZE]f32,
-    parent_buf: *[C_BUF_SIZE]f32,
-    offsets: *[N_BUCKETS]u16,
-    child_indices: *[M2M_N_ENTRIES]u16,
-    v_indices: *[M2M_N_ENTRIES]u16,
-    signs: *[M2M_N_ENTRIES]u32
+// --- Unified sparse translation (M2M / M2L / L2L) ---
+//
+// The three operators (M2M upward, M2L, L2L downward) are the SAME sparse
+// translation of one expansion through a precomputed CSR operator table
+// (offsets + source/v indices + packed signs). They were three byte-identical
+// copies differing only in the array-length type annotations and the v_buf size
+// (90 for M2L, 30 for M2M/L2L). Collapsed into ONE function to cut .text (two
+// copies of the heaviest arithmetic block + their inlined decode_sign sites
+// removed). Pointers are unsized [*]T: the loop is CSR-bounded by `offsets`, so
+// the compile-time array length is never used in the body. Math is byte-for-byte
+// identical to the three originals — verified numerically to rel ~1e-15.
+//   src_buf = the source expansion (child for M2M, source for M2L, parent for
+//   L2L); tgt_buf = the target it accumulates (+=) into; v_buf = translation-
+//   vector harmonics (30 floats for M2M/L2L, 90 for M2L).
+fn translate(
+    v_buf: [*]f32,
+    src_buf: [*]f32,
+    tgt_buf: [*]f32,
+    offsets: [*]u16,
+    src_indices: [*]u16,
+    v_indices: [*]u16,
+    signs: [*]u32
 ) void {
-
     for (@range(u16, N_COEFFS)) |f_idx| {
-
         var accum_r: f32 = 0.0;
         var accum_i: f32 = 0.0;
-
-        const start_idx: u16 = offsets.*[f_idx];
-        const end_idx: u16 = offsets.*[f_idx + 1];
-
+        const start_idx: u16 = offsets[f_idx];
+        const end_idx: u16 = offsets[f_idx + 1];
         for (@range(u16, start_idx, end_idx, 1)) |i| {
-
-            const ci: u16 = child_indices.*[i];
-            const c_r: f32 = child_buf.*[ci];
-            const c_i: f32 = child_buf.*[ci + 1];
-
-            const vi: u16 = v_indices.*[i];
-            const v_r: f32 = v_buf.*[vi];
-            const v_i: f32 = v_buf.*[vi + 1];
-
-            const s: u16 = @as(u16, signs.*[i] & 0xFFFF);
+            const ci: u16 = src_indices[i];
+            const c_r: f32 = src_buf[ci];
+            const c_i: f32 = src_buf[ci + 1];
+            const vi: u16 = v_indices[i];
+            const v_r: f32 = v_buf[vi];
+            const v_i: f32 = v_buf[vi + 1];
+            const s: u16 = @as(u16, signs[i] & 0xFFFF);
             const s_rr: f32 = decode_sign(s, 0);
             const s_ri: f32 = decode_sign(s, 1);
             const s_ir: f32 = decode_sign(s, 2);
             const s_ii: f32 = decode_sign(s, 3);
-
             accum_r += s_rr * c_r * v_r + s_ri * c_i * v_i;
             accum_i += s_ir * c_r * v_i + s_ii * c_i * v_r;
         }
-
         const p_idx: u16 = f_idx * 2;
-        parent_buf.*[p_idx] += accum_r;
-        parent_buf.*[p_idx + 1] += accum_i;
-    }
-}
-
-
-// --- M2L Translation (PACKED SIGNS) ---
-//
-// Source expansion is at order P (C_BUF_SIZE), the translation-vector
-// expansion is at order 2P (C_BUF_M2L_SIZE), the target local expansion is at
-// order P. The heavy phase of the FMM; in 2.5D the source arrives via the
-// plane router, but the math is unchanged.
-
-fn m2l_translate(
-    v_buf: *[C_BUF_M2L_SIZE]f32,
-    source_buf: *[C_BUF_SIZE]f32,
-    target_buf: *[C_BUF_SIZE]f32,
-    offsets: *[N_BUCKETS]u16,
-    source_indices: *[M2L_N_ENTRIES]u16,
-    v_indices: *[M2L_N_ENTRIES]u16,
-    signs: *[M2L_N_ENTRIES]u32
-) void {
-
-    for (@range(u16, N_COEFFS)) |t_idx| {
-
-        var accum_r: f32 = 0.0;
-        var accum_i: f32 = 0.0;
-
-        const start_idx: u16 = offsets.*[t_idx];
-        const end_idx: u16 = offsets.*[t_idx + 1];
-
-        for (@range(u16, start_idx, end_idx, 1)) |i| {
-
-            const si: u16 = source_indices.*[i];
-            const c_r: f32 = source_buf.*[si];
-            const c_i: f32 = source_buf.*[si + 1];
-
-            const vi: u16 = v_indices.*[i];
-            const v_r: f32 = v_buf.*[vi];
-            const v_i: f32 = v_buf.*[vi + 1];
-
-            const s: u16 = @as(u16, signs.*[i] & 0xFFFF);
-            const s_rr: f32 = decode_sign(s, 0);
-            const s_ri: f32 = decode_sign(s, 1);
-            const s_ir: f32 = decode_sign(s, 2);
-            const s_ii: f32 = decode_sign(s, 3);
-
-            accum_r += s_rr * c_r * v_r + s_ri * c_i * v_i;
-            accum_i += s_ir * c_r * v_i + s_ii * c_i * v_r;
-        }
-
-        const t_mem_idx: u16 = t_idx * 2;
-        target_buf.*[t_mem_idx] += accum_r;
-        target_buf.*[t_mem_idx + 1] += accum_i;
-    }
-}
-
-
-// --- L2L Translation (PACKED SIGNS) ---
-//
-// Propagates a parent local expansion down to a child. Shares the table
-// structure with M2M (the generator derives L2L from the M2M routine). In 2.5D
-// the parent expansion arrives via a plane exchange on the way down the tree.
-
-fn l2l_translate(
-    v_buf: *[C_BUF_SIZE]f32,
-    parent_buf: *[C_BUF_SIZE]f32,
-    child_buf: *[C_BUF_SIZE]f32,
-    offsets: *[N_BUCKETS]u16,
-    source_indices: *[L2L_N_ENTRIES]u16,
-    v_indices: *[L2L_N_ENTRIES]u16,
-    signs: *[L2L_N_ENTRIES]u32
-) void {
-
-    for (@range(u16, N_COEFFS)) |c_idx| {
-
-        var accum_r: f32 = 0.0;
-        var accum_i: f32 = 0.0;
-
-        const start_idx: u16 = offsets.*[c_idx];
-        const end_idx: u16 = offsets.*[c_idx + 1];
-
-        for (@range(u16, start_idx, end_idx, 1)) |i| {
-
-            const pi: u16 = source_indices.*[i];
-            const p_r: f32 = parent_buf.*[pi];
-            const p_i: f32 = parent_buf.*[pi + 1];
-
-            const vi: u16 = v_indices.*[i];
-            const v_r: f32 = v_buf.*[vi];
-            const v_i: f32 = v_buf.*[vi + 1];
-
-            const s: u16 = @as(u16, signs.*[i] & 0xFFFF);
-            const s_rr: f32 = decode_sign(s, 0);
-            const s_ri: f32 = decode_sign(s, 1);
-            const s_ir: f32 = decode_sign(s, 2);
-            const s_ii: f32 = decode_sign(s, 3);
-
-            accum_r += s_rr * p_r * v_r + s_ri * p_i * v_i;
-            accum_i += s_ir * p_r * v_i + s_ii * p_i * v_r;
-        }
-
-        const c_mem_idx: u16 = c_idx * 2;
-        child_buf.*[c_mem_idx] += accum_r;
-        child_buf.*[c_mem_idx + 1] += accum_i;
+        tgt_buf[p_idx] += accum_r;
+        tgt_buf[p_idx + 1] += accum_i;
     }
 }
 

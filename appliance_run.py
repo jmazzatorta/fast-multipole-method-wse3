@@ -300,22 +300,11 @@ def main():
     print("[1/4] Binning bodies into column layout...")
     bodies_flat, col_len, CELL_BLOCK = build_bodies_tensor(bodies, C, max_bodies_pe)
 
-    print("[2/4] Packing M2L agendas/quotas per level...")
+    # Step-6a: the old M2L send-agenda/quota packing was removed. M2L transport
+    # is being replaced by the validated window-shift (grafted next). The M2L
+    # math tables are still loaded and pushed below. `levels` is kept for the
+    # math-table broadcast loop and the launch loop.
     levels = [2, 3, 4]
-    # Per-level agenda bound, matching constants.csl exactly:
-    #   bound(L) = M2L_MAX_DESTS * ceil( (C / 2**(TREE_H-L)) / K_CUBES )
-    # i.e. 48 * ceil(nz_at_level / K). TREE_H = log2(C). For C=16,K=4:
-    #   L4 -> 192, L3 -> 96, L2 -> 48.
-    K_CUBES = int(d["params"]["K_CUBES"])
-    M2L_MAX_DESTS = 48
-    TREE_H = C.bit_length() - 1  # log2(C)
-    def agenda_bound(level):
-        nz = C // (2 ** (TREE_H - level))   # cubes along Z in a box at this level
-        msgs = (nz + K_CUBES - 1) // K_CUBES
-        return M2L_MAX_DESTS * msgs
-    agenda_sz = {lv: agenda_bound(lv) for lv in levels}
-    print(f"       per-level agenda bounds: {agenda_sz}")
-    packed = {lv: pack_m2l_level(routing, C, lv, agenda_sz[lv]) for lv in levels}
 
     err = None
     forces_3d = None
@@ -339,11 +328,13 @@ def main():
                 "l2l_v_indices": runner.get_id("ptr_l2l_v_indices"),
                 "l2l_signs": runner.get_id("ptr_l2l_signs"),
             }
-            for lv in levels:
-                sym[f"agenda{lv}"]   = runner.get_id(f"ptr_m2l_agenda_lvl{lv}")
-                sym[f"nsend{lv}"]    = runner.get_id(f"ptr_num_send_lvl{lv}")
-                sym[f"nrecv{lv}"]    = runner.get_id(f"ptr_recv_expected_lvl{lv}")
-                sym[f"nfwd{lv}"]     = runner.get_id(f"ptr_fwd_expected_lvl{lv}")
+            # Step-6a: the old M2L send-agenda + quota transport was removed from
+            # the kernel (pe.csl). Its host-side symbols (ptr_m2l_agenda_lvl*,
+            # ptr_num_send_lvl*, ptr_recv_expected_lvl*, ptr_fwd_expected_lvl*)
+            # no longer exist, so we neither resolve nor push them here. The M2L
+            # *math* tables above (ptr_m2l_offsets/source_indices/v_indices/signs)
+            # are KEPT: apply_m2l_message still uses them. The new window-shift
+            # transport, grafted next, will load whatever data IT needs.
 
             print("[3/4] Pushing data...")
             # math tables (broadcast)
@@ -356,28 +347,84 @@ def main():
                 h2d_bcast_u16(runner, sym[f"{nm}_v_indices"], math[nm]["v_indices"], side)
                 h2d_bcast_u32(runner, sym[f"{nm}_signs"], math[nm]["signs"], side)
 
-            # agendas + quotas (per-PE)
-            for lv in levels:
-                a3d, nsend, nrecv, nfwd = packed[lv]
-                h2d_per_pe_u32(runner, sym[f"agenda{lv}"], a3d, side, agenda_sz[lv])
-                h2d_per_pe_u32(runner, sym[f"nsend{lv}"], nsend, side, 1)
-                h2d_per_pe_u32(runner, sym[f"nrecv{lv}"], nrecv, side, 1)
-                h2d_per_pe_u32(runner, sym[f"nfwd{lv}"],  nfwd,  side, 1)
+            # Step-6a: M2L agenda/quota H2D removed (symbols no longer in kernel).
 
             # bodies (per-PE)
             h2d_per_pe_u32(runner, sym["bodies_col"], bodies_flat, side, col_len)
 
+            sym["fmm_done"] = runner.get_id("ptr_fmm_done")
+
+            # PROBE 0: read fmm_done BEFORE any launch. The device is freshly
+            # initialized; fmm_done is @zeros so this should return all zeros
+            # quickly. If THIS d2h hangs, the problem is the memcpy/RPC layer
+            # itself (or a version mismatch), NOT our FMM phase code.
+            print("[probe] d2h fmm_done BEFORE any launch...", flush=True)
+            tp = time.time()
+            pre = np.zeros(side * side, dtype=np.uint32)
+            runner.memcpy_d2h(pre, sym["fmm_done"], 0, 0, side, side, 1,
+                              streaming=False,
+                              data_type=MemcpyDataType.MEMCPY_32BIT,
+                              nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+            print(f"[probe] pre-launch d2h OK in {time.time()-tp:.3f} s  "
+                  f"(sum={int(pre.sum())}, expect 0)", flush=True)
+
             print("[4/4] Launching FMM phases (host-barriered)...")
-            # Each launch returns only after ALL PEs finish -> global barrier.
             for phase in ("run_p2m", "run_m2m_upward", "run_m2l",
                           "run_l2l_downward", "run_l2p", "run_p2p"):
                 t0 = time.time()
                 runner.launch(phase, nonblock=False)
-                print(f"      {phase:18s} {time.time()-t0:.3f} s")
+                dt = time.time() - t0
+                print(f"      {phase:18s} {dt:.3f} s", flush=True)
+                t1 = time.time()
+                done = np.zeros(side * side, dtype=np.uint32)
+                runner.memcpy_d2h(done, sym["fmm_done"], 0, 0, side, side, 1,
+                                  streaming=False,
+                                  data_type=MemcpyDataType.MEMCPY_32BIT,
+                                  nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+                ndone = int((done == 1).sum())
+                print(f"        fmm_done = {ndone}/{side*side} PEs  "
+                      f"(d2h {time.time()-t1:.3f} s)", flush=True)
+                if ndone != side * side:
+                    missing = [(int(i % side), int(i // side))
+                               for i in np.where(done != 1)[0][:12]]
+                    print(f"        NOT done (first 12, as (px,py)): {missing}",
+                          flush=True)
+                    # DIAGNOSTIC: for L2L, D2H the per-PE l2l_dbg snapshot to see
+                    # the cascade state of the stuck PEs. l2l_dbg is [5]u32 per PE:
+                    # [0]=entered [1]=recv_count [2]=recv_expected
+                    # [3]=z3_done|cursor_done<<1|active<<2|tx_not_idle<<3 [4]=signalled
+                    if phase == "run_l2l_downward":
+                        try:
+                            dbg = np.zeros(side * side * 5, dtype=np.uint32)
+                            runner.memcpy_d2h(dbg, runner.get_id("ptr_l2l_dbg"),
+                                              0, 0, side, side, 5, streaming=False,
+                                              data_type=MemcpyDataType.MEMCPY_32BIT,
+                                              nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+                            dbg = dbg.reshape(side * side, 5)
+                            print("        L2L DBG for stuck PEs "
+                                  "[entered recv/exp st signalled]:", flush=True)
+                            shown = 0
+                            for i in np.where(done != 1)[0]:
+                                px, py = int(i % side), int(i // side)
+                                e, rc, re_, st, sg = dbg[i]
+                                print(f"          ({px:2d},{py:2d}) "
+                                      f"entered={e} recv={rc}/{re_} "
+                                      f"st={st}(z3={st&1} cur={(st>>1)&1} "
+                                      f"act={(st>>2)&1} txbusy={(st>>3)&1}) "
+                                      f"sig={sg}", flush=True)
+                                shown += 1
+                                if shown >= 20:
+                                    print("          ... (truncated)", flush=True)
+                                    break
+                        except Exception as de:
+                            print(f"        (l2l_dbg read failed: {de!r})", flush=True)
 
             # pull forces
+            print("      pulling forces (d2h forces_col)...", flush=True)
+            tf = time.time()
             forces_3d = d2h_per_pe_f32(runner, sym["forces_col"],
                                        side, C * max_bodies_pe * FLOATS_PER_BODY)
+            print(f"      forces d2h {time.time()-tf:.3f} s", flush=True)
     except Exception as e:
         err = repr(e)
         print(f"\n[appliance_run] ERROR: {err}")

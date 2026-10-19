@@ -23,7 +23,10 @@
 //   level 0 (root): 1   node    -> m_lvl0 / l_lvl0
 // Total 2C-1 M nodes + 2C-1 L nodes = 7.27 KB at P=4, C=16.
 
-const simprint = @import_module("<simprint>");
+// NOTE: the <simprint> debug-print module was removed. Its inline byte loop over
+// the format string forced --max-inlined-iterations above our FMM loop sizes,
+// and its format strings + formatting code consumed .data.hi / .text. Phase
+// progress is instead observed via the host-side barrier returns and fmm_done.
 
 // memcpy params struct from the layout. Declared untyped: the `comptime_struct`
 // type annotation is not accepted by the current cslc (server 1.20.2).
@@ -107,38 +110,22 @@ export var l2l_v_indices      = @zeros([cons.L2L_N_ENTRIES]u16);
 export var l2l_signs          = @zeros([cons.L2L_N_ENTRIES]u32);
 
 // ===========================================================================
-// M2L AGENDAS AND QUOTAS  (per level, loaded by host via memcpy)
+// M2L AGENDAS AND QUOTAS  -- REMOVED (Step-6a prune of the OLD M2L transport)
 // ===========================================================================
-// m2l_agenda_lvlN: packed messages this PE ORIGINATES at level N. Each entry is
-// a u32 header-like word (tgt_x,tgt_y,tag,zbase,zcount) built by the generator
-// with the same field layout as the runtime header (minus msg_type/level, which
-// are known from the phase). num_send_lvlN = number of valid entries.
-// Per-level sizing: each buffer only ever holds its own level's entries, so we
-// size each to its geometric upper bound (see constants.csl) rather than a
-// single generous MAX_AGENDA. Saves per-PE .bss with no behavior change.
-export var m2l_agenda_lvl2 = @zeros([cons.MAX_AGENDA_L2]u32);
-export var m2l_agenda_lvl3 = @zeros([cons.MAX_AGENDA_L3]u32);
-export var m2l_agenda_lvl4 = @zeros([cons.MAX_AGENDA_L4]u32);
-export var num_send_lvl2 = @zeros([1]u32);
-export var num_send_lvl3 = @zeros([1]u32);
-export var num_send_lvl4 = @zeros([1]u32);
+// The old agenda-based M2L send driver and its per-level send/recv/forward
+// quotas were removed here. The new window-shift transport (next step) does not
+// use a host-loaded send agenda. The M2L MATH (apply_m2l_message), the operator
+// tables (m2l_offsets/source_indices/v_indices/signs), and the shared
+// send/rx/dispatch layer are all kept. Removed from this block:
+//   m2l_agenda_lvl{2,3,4}, num_send_lvl{2,3,4},
+//   recv_expected_lvl{2,3,4}, fwd_expected_lvl{2,3,4},
+//   m2l_recv_count[3], m2l_fwd_count[3], m2l_send_idx, m2l_cur_level,
+//   m2l_phase_active  (and their host-pointer exports further down).
 
-// Quotas: how many messages this PE will RECEIVE (own) and FORWARD per level.
-// Termination at a level: received == recv_expected AND forwarded == fwd_expected
-// AND all my sends launched. All three are geometry-known a priori.
-export var recv_expected_lvl2 = @zeros([1]u32);
-export var recv_expected_lvl3 = @zeros([1]u32);
-export var recv_expected_lvl4 = @zeros([1]u32);
-export var fwd_expected_lvl2 = @zeros([1]u32);
-export var fwd_expected_lvl3 = @zeros([1]u32);
-export var fwd_expected_lvl4 = @zeros([1]u32);
-
-// Runtime counters (decremented/incremented as the phase runs).
-var m2l_recv_count : u32 = 0;
-var m2l_fwd_count : u32 = 0;
-var m2l_send_idx : u32 = 0;        // next agenda entry to originate
-var m2l_cur_level : u16 = 4;       // M2L runs leaf-first (level 4 -> 3 -> 2)
-var m2l_phase_active : u16 = 0;
+// (Diagnostic dump buffer m2l_diag[20] and the dbg_* activity counters were
+// removed to free PE memory: the new L2L event-driven code pushed .bss / task
+// table over the per-PE limit. They can be reintroduced, minimally and targeted,
+// if a specific phase needs on-device instrumentation again.)
 
 // P2P runtime state. P2P is strictly 1-hop: each PE sends body-slabs to its <=8
 // plane neighbours and receives from them. No transit, no forwarding.
@@ -152,6 +139,21 @@ var p2p_recv_count : u32 = 0;
 var p2p_recv_expected : u32 = 0;
 var p2p_phase_active : u16 = 0;
 var l2p_done : u16 = 0;
+// P2P event-driven send cursor (same completion-driven model as L2L: no busy
+// loop, which deadlocks the cooperative scheduler). P2P is 1-hop (direct to the
+// <=8 plane neighbours, no transit), so the cursor just walks (dir8, cbase):
+// dir8 = 0..7 enumerates the 8 neighbour offsets, cbase steps the C cells in
+// slabs of P2P_CELLS_PER_MSG. emit one, return; next emitted from tx_complete.
+var p2p_active   : u16 = 0;   // 1 while the P2P send agenda is running
+var p2p_dir8     : u16 = 0;   // which of the 8 neighbour offsets (0..7)
+var p2p_cbase    : u16 = 0;   // cell-slab base within the current neighbour
+var p2p_cursor_done : u16 = 0;
+// One-shot unblock latch (same role as l2l_done_signalled): guarantees this PE
+// calls unblock_cmd_stream() EXACTLY once per P2P launch. Without it, the
+// run_p2p fallback and a later tx_complete gate-pass can both unblock (double
+// unblock desyncs the host command stream -> D2H hangs). Keyed off this latch,
+// NOT off p2p_phase_active, so the two paths are mutually exclusive.
+var p2p_done_signalled : u16 = 0;
 
 // ===========================================================================
 // COLUMN BODIES  (Option 1: fixed per-cell blocks)
@@ -264,15 +266,81 @@ var tx_inflight_w : u16 = 0; var tx_next_w : u16 = 0;
 var tx_inflight_n : u16 = 0; var tx_next_n : u16 = 0;
 var tx_inflight_s : u16 = 0; var tx_next_s : u16 = 0;
 
+// --- L2L event-driven send agenda (completion-driven, no busy-loop) ----------
+// WSE-3 schedules tasks cooperatively (run-to-completion): a synchronous
+// while(!sent) spin never returns to the scheduler, so the tx_complete task
+// that frees a tx slot can never run -> self-deadlock once the ring (NBUF=2)
+// fills. L2L's representative originates a large divergent fan-out (up to 255
+// messages at the root level), which overruns the ring immediately. So instead
+// of spinning, L2L enumerates its destinations as a cursor and emits one
+// message at a time: run_l2l_downward pumps the first messages, and each
+// tx_complete_<dir> emits the next. The payload for every destination of a
+// block is the SAME local expansion l_level_ptr(parent_level), so the cursor
+// only needs (level, ox, oy, zbase).
+// The L2L downward pass is a two-broadcast hierarchical cascade, starting at
+// level 2 (levels 0,1 are zero in FMM and are NOT header-representable, so they
+// are skipped; z_local is applied only where there is real data):
+//   level-2 rep (px%4==0,py%4==0): holds l_lvl2 from M2L. Broadcasts l_lvl2 to
+//     the 3 OTHER level-3 reps in its 4x4 block (offsets {0,2}x{0,2}\(0,0)),
+//     and locally does z2->l_lvl3, z3->l_lvl4.
+//   level-3 rep (px%2==0,py%2==0): once it holds l_lvl3 (its own, or received),
+//     broadcasts l_lvl3 to the 3 other members of its 2x2 block
+//     (offsets {0,1}x{0,1}\(0,0)), and does z3->l_lvl4.
+//   plain leaf: receives l_lvl3 (2 half-messages, 8 Z-cubes / K=4), does z3.
+// Every message rides the shared router (try_send + FIFO forward). The send is
+// event-driven: emit one, return; the next is emitted from tx_complete. No spin.
+//
+// A level-2 rep runs BOTH broadcasts: first the level-2 set (3 l3-reps), then
+// the level-3 set (its own 2x2). One linear cursor walks phase 2 then phase 3.
+// A non-l2 level-3 rep runs ONLY the level-3 set, started from rx_complete after
+// it has received l_lvl2 and done z2.
+var l2l_active   : u16 = 0;    // 1 while this PE's send agenda is running
+var l2l_phase    : u16 = 0;    // cursor phase: 2 = sending l_lvl2, 3 = sending l_lvl3
+var l2l_di       : u16 = 0;    // destination index 0..2 within the current phase (3 dests)
+var l2l_zbase    : u16 = 0;    // z-block base within the current destination
+var l2l_cursor_done : u16 = 0; // 1 when this PE's agenda has enumerated everything
+var l2l_run_l3only  : u16 = 0; // 1 if this agenda is the level-3-only one (non-l2 rep)
+// Termination (per-PE, by count):
+var l2l_recv_count    : u16 = 0;  // L2L plane messages received so far
+var l2l_recv_expected : u16 = 0;  // messages this PE expects: 0 (l2-rep) /1 (l3-rep) /2 (leaf)
+var l2l_z3_done       : u16 = 0;  // 1 once this PE has produced its l_lvl4 (z3 applied)
+var l2l_entered       : u16 = 0;  // 1 once this PE has begun its cascade (seed or on recv)
+var l2l_done_signalled: u16 = 0;  // one-shot latch: phase_signal_done fired exactly once
+
 // --- RX buffers: NBUF per direction -------------------------------------
-var rx_buf_e = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
-var rx_buf_w = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
-var rx_buf_n = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
-var rx_buf_s = @zeros([cons.NBUF * cons.MSG_SIZE]f32);
-var rx_next_e : u16 = 0;
-var rx_next_w : u16 = 0;
-var rx_next_n : u16 = 0;
-var rx_next_s : u16 = 0;
+// RX buffers use NBUF_RX (independent of tx NBUF) to trim per-PE .bss.
+var rx_buf_e = @zeros([cons.NBUF_RX * cons.MSG_SIZE]f32);
+var rx_buf_w = @zeros([cons.NBUF_RX * cons.MSG_SIZE]f32);
+var rx_buf_n = @zeros([cons.NBUF_RX * cons.MSG_SIZE]f32);
+var rx_buf_s = @zeros([cons.NBUF_RX * cons.MSG_SIZE]f32);
+var rx_next = @zeros([4]u16);   // per-direction next rx slot (0=E,1=W,2=N,3=S)
+
+// --- Transit FIFOs: one per OUTGOING DIRECTION (E/W/N/S) -----------------
+// Whole-message ring buffers that decouple receive from forward. When a transit
+// message arrives it is copied here and the rx drain is re-armed at once, so the
+// rx buffer is never held by a message waiting to be forwarded.
+//
+// CRITICAL (deadlock-freedom): there is one FIFO PER DIRECTION, not per
+// dimension. Northbound and southbound transit traffic must NOT share a buffer:
+// two adjacent PEs in a column each sending toward the other (one N, one S)
+// would otherwise fill one shared Y-FIFO and wait on each other forever — a
+// head-to-head cycle that XY routing does NOT prevent (the cycle is on the
+// buffer resource, length 2, not on the path). Separating E/W/N/S breaks it: a
+// northbound message never occupies a southbound buffer. Verified deadlock-free
+// in a discrete-event model of this exact traffic (0/80 adversarial seeds) at
+// depth 2; a shared-per-dimension (2-FIFO) variant deadlocks.
+var fwd_fifo_e = @zeros([cons.FWD_FIFO_DEPTH * cons.MSG_SIZE]f32);
+var fwd_fifo_w = @zeros([cons.FWD_FIFO_DEPTH * cons.MSG_SIZE]f32);
+var fwd_fifo_n = @zeros([cons.FWD_FIFO_DEPTH * cons.MSG_SIZE]f32);
+var fwd_fifo_s = @zeros([cons.FWD_FIFO_DEPTH * cons.MSG_SIZE]f32);
+// Per-direction FIFO head/tail/count as [4]u16 arrays (index 0=E,1=W,2=N,3=S),
+// so fifo_drain_one / fwd_fifo_push can be written once instead of 4x.
+var ff_head  = @zeros([4]u16);
+var ff_tail  = @zeros([4]u16);
+var ff_count = @zeros([4]u16);
+// A source rx direction left un-armed because its target FIFO was full. The
+// drain re-arms any blocked rx when it frees a slot. One flag per rx direction.
+var rx_blocked = @zeros([4]u16);  // per-direction "rx un-armed, FIFO was full"
 
 // --- DSDs (output), one per direction, extent MSG_SIZE ------------------
 // Color is bound to the queue via @initialize_queue (comptime), NOT passed here
@@ -317,64 +385,55 @@ fn msg_payload_len(h: u32) u16 { return hdr_zcount(h) * cons.C_BUF_SIZE; }
 // --- Low-level: copy header+payload into a tx slot and launch async ------
 // src points at a MSG_PAYLOAD_MAX-sized payload buffer; we write header to
 // slot[0] then payload to slot[1..1+plen], then fire the whole MSG_SIZE async.
+// Shared body of tx_launch: write the header at buf[slot_base], then copy the
+// payload into buf[slot_base+1 .. +plen]. `buf` is a runtime pointer into one of
+// the tx_buf_<dir> arrays (rebasing a mem1d_dsd from a runtime pointer is the
+// same idiom the source DSD already uses). Written ONCE instead of 4x; the
+// per-direction @mov32 (comptime fabout DSD + comptime ut_id) stays in the 4-way
+// tail below, which is the only part CSL forces to be per-direction.
+fn tx_fill_slot(buf: [*]f32, slot_base: u16, header: u32,
+                src: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) void {
+    buf[slot_base] = @bitcast(f32, header);
+    // Build both mem1d DSDs over a fixed named array (tx_buf_e) purely as a
+    // template for @get_dsd, then rebase each to its real runtime pointer. The
+    // tensor_access lambda cannot deref a runtime pointer, so it must name a
+    // compile-time array; the base address is then overridden by the rebase, so
+    // tx_buf_e's contents are never read through these DSDs. This is the same
+    // build-then-rebase idiom the original per-direction code used.
+    var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
+    d = @set_dsd_base_addr(d, @ptrcast([*]f32, &buf[slot_base + 1]));
+    const dl = @set_dsd_length(d, plen);
+    var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
+    s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
+    const sl = @set_dsd_length(s, plen);
+    @fmovs(dl, sl);
+}
+
 fn tx_launch(dir: u16, slot_base: u16, header: u32,
              src: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) void {
     // The payload copy uses the message's real length; the fabric send is fixed
     // MSG_SIZE so the receiver always drains a whole message (unused tail is
     // whatever was in the slot; receiver ignores beyond plen via header zcount).
+    // Shared fill, then a per-direction async send whose fabout DSD and ut_id are
+    // irreducibly comptime (CSL: fabout DSD is a comptime const; .ut_id must be
+    // comptime-known), so the @mov32 stays in a 4-way comptime tail.
     if (dir == 0) {
-        tx_buf_e[slot_base] = @bitcast(f32, header);
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_e[slot_base + 1]));
-        const dl = @set_dsd_length(d, plen);
-        // Source DSD: build over a named array, then rebase to the `src` pointer.
-        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
-        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_e[i] });
-        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
-        const sl = @set_dsd_length(s, plen);
-        @fmovs(dl, sl);
+        tx_fill_slot(@ptrcast([*]f32, &tx_buf_e[0]), slot_base, header, src, plen);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_e[i] });
         send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_e[slot_base]));
         @mov32(tx_dsd_e, send, .{ .async = true, .ut_id = @get_ut_id(2), .activate = cons.tx_complete_e_id });
     } else if (dir == 1) {
-        tx_buf_w[slot_base] = @bitcast(f32, header);
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_w[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_w[slot_base + 1]));
-        const dl = @set_dsd_length(d, plen);
-        // Source DSD: build over a named array, then rebase to the `src` pointer.
-        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
-        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_w[i] });
-        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
-        const sl = @set_dsd_length(s, plen);
-        @fmovs(dl, sl);
+        tx_fill_slot(@ptrcast([*]f32, &tx_buf_w[0]), slot_base, header, src, plen);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_w[i] });
         send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_w[slot_base]));
         @mov32(tx_dsd_w, send, .{ .async = true, .ut_id = @get_ut_id(3), .activate = cons.tx_complete_w_id });
     } else if (dir == 2) {
-        tx_buf_n[slot_base] = @bitcast(f32, header);
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_n[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_n[slot_base + 1]));
-        const dl = @set_dsd_length(d, plen);
-        // Source DSD: build over a named array, then rebase to the `src` pointer.
-        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
-        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_n[i] });
-        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
-        const sl = @set_dsd_length(s, plen);
-        @fmovs(dl, sl);
+        tx_fill_slot(@ptrcast([*]f32, &tx_buf_n[0]), slot_base, header, src, plen);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_n[i] });
         send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_n[slot_base]));
         @mov32(tx_dsd_n, send, .{ .async = true, .ut_id = @get_ut_id(4), .activate = cons.tx_complete_n_id });
     } else {
-        tx_buf_s[slot_base] = @bitcast(f32, header);
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_s[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tx_buf_s[slot_base + 1]));
-        const dl = @set_dsd_length(d, plen);
-        // Source DSD: build over a named array, then rebase to the `src` pointer.
-        // A pointer deref (src.*[i]) is not allowed inside a tensor_access lambda.
-        var s = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_PAYLOAD_MAX} -> tx_buf_s[i] });
-        s = @set_dsd_base_addr(s, @ptrcast([*]f32, &src.*[0]));
-        const sl = @set_dsd_length(s, plen);
-        @fmovs(dl, sl);
+        tx_fill_slot(@ptrcast([*]f32, &tx_buf_s[0]), slot_base, header, src, plen);
         var send = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> tx_buf_s[i] });
         send = @set_dsd_base_addr(send, @ptrcast([*]f32, &tx_buf_s[slot_base]));
         @mov32(tx_dsd_s, send, .{ .async = true, .ut_id = @get_ut_id(5), .activate = cons.tx_complete_s_id });
@@ -423,102 +482,122 @@ fn try_send(tgt_x: u16, tgt_y: u16, header: u32,
     return true;
 }
 
-// --- Handle a fully-received message (payload already in rx buffer) -----
-// If for us: process. Else: try to forward; if no tx buffer free, the caller
-// leaves it in its rx buffer (we signal failure so rx is not yet reused).
-// Returns true if consumed (processed or forwarded), false if must stay in rx.
-fn handle_message(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) bool {
+// --- Transit FIFO push: copy a transit message into its DIRECTION FIFO ------
+// out_dir in {0=E,1=W,2=N,3=S} selects the per-direction FIFO. Returns true if
+// enqueued, false if that FIFO is full (caller records backpressure on dir_rx
+// and leaves rx un-advanced). Copies the whole MSG_SIZE from the rx slot into
+// the FIFO slot so the rx buffer can be re-armed at once. One FIFO per direction
+// is what keeps the router deadlock-free (no shared N/S or E/W buffer).
+fn fwd_fifo_push(out_dir: u16, src_base: u16, dir_rx: u16) bool {
+    if (ff_count[out_dir] >= cons.FWD_FIFO_DEPTH) { mark_rx_blocked(dir_rx); return false; }
+    copy_msg_from_rx(out_dir, ff_tail[out_dir] * cons.MSG_SIZE, dir_rx, src_base);
+    ff_tail[out_dir] = (ff_tail[out_dir] + 1) % cons.FWD_FIFO_DEPTH;
+    ff_count[out_dir] += 1;
+    @activate(cons.fifo_drain_task_id);
+    return true;
+}
+
+// Base pointer of the rx buffer / forwarding FIFO of a direction (0=E,1=W,2=N,
+// 3=S). Selecting the array once (4-way) and then doing the common work removes
+// the per-iteration 4-way ladders and lets fifo_drain_one be written once.
+fn rx_buf_base(dir: u16) [*]f32 {
+    if (dir == 1) { return @ptrcast([*]f32, &rx_buf_w[0]); }
+    if (dir == 2) { return @ptrcast([*]f32, &rx_buf_n[0]); }
+    if (dir == 3) { return @ptrcast([*]f32, &rx_buf_s[0]); }
+    return @ptrcast([*]f32, &rx_buf_e[0]);
+}
+fn fwd_fifo_base(dir: u16) [*]f32 {
+    if (dir == 1) { return @ptrcast([*]f32, &fwd_fifo_w[0]); }
+    if (dir == 2) { return @ptrcast([*]f32, &fwd_fifo_n[0]); }
+    if (dir == 3) { return @ptrcast([*]f32, &fwd_fifo_s[0]); }
+    return @ptrcast([*]f32, &fwd_fifo_e[0]);
+}
+
+// Copy MSG_SIZE wavelets from rx buffer of direction dir_rx (slot base src_base)
+// into the FIFO of out-direction fdir (0=E,1=W,2=N,3=S) at offset db. Pointers
+// are selected once outside the loop (not per iteration).
+fn copy_msg_from_rx(fdir: u16, db: u16, dir_rx: u16, src_base: u16) void {
+    const srcb = rx_buf_base(dir_rx);
+    const dstb = fwd_fifo_base(fdir);
+    var i : u16 = 0;
+    while (i < cons.MSG_SIZE) {
+        dstb[db + i] = srcb[src_base + i];
+        i += 1;
+    }
+}
+
+fn mark_rx_blocked(dir_rx: u16) void {
+    rx_blocked[dir_rx] = 1;
+}
+
+// --- Handle a fully-received message (already in the rx slot src_base) ------
+// If for us: process (returns true). Else: enqueue into the out-direction FIFO;
+// returns true if enqueued, false if that FIFO is full (rx must not advance).
+fn handle_message(header: u32, src_base: u16, dir_rx: u16, plen: u16) bool {
     if (hdr_tgt_x(header) == pe_x and hdr_tgt_y(header) == pe_y) {
-        process_message_local_payload(header, payload, plen);
+        var pay : *[cons.MSG_PAYLOAD_MAX]f32 = rx_payload_ptr(dir_rx, src_base);
+        process_message_local_payload(header, pay, plen);
         return true;
     }
-    const forwarded = try_send(hdr_tgt_x(header), hdr_tgt_y(header), header, payload, plen);
-    if (forwarded) {
-        note_forward();   // count a successfully forwarded transit message
-    }
-    return forwarded;
+    const out_dir = out_dir_for(hdr_tgt_x(header), hdr_tgt_y(header));
+    return fwd_fifo_push(out_dir, src_base, dir_rx);
+}
+
+// Payload pointer (just past the header) into direction dir_rx's rx slot.
+fn rx_payload_ptr(dir_rx: u16, src_base: u16) *[cons.MSG_PAYLOAD_MAX]f32 {
+    if (dir_rx == 1) { return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_w[src_base + 1]); }
+    if (dir_rx == 2) { return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_n[src_base + 1]); }
+    if (dir_rx == 3) { return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_s[src_base + 1]); }
+    return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_e[src_base + 1]);
 }
 
 // --- RX: armed async drains + completion tasks (NO data tasks) -----------
-// Following the working WSE-3 reference: receive is an explicit async @mov32
-// from the fabin DSD into a memory slot, activating a completion task. WE decide
-// when to drain (an "armed" drain per direction); on completion we handle the
-// message and RE-ARM the drain so the direction is always listening. This is the
-// non-blocking receive we need, and because we control the drain there is no
-// data-task redispatch ambiguity.
+// Receive is an explicit async @mov32 from the fabin DSD into a memory slot,
+// activating a completion task. On completion we process (if local) or copy the
+// message into its out-direction transit FIFO, then RE-ARM at once so the rx
+// buffer is never held by a message awaiting forward. If the target FIFO is
+// full we do NOT advance/re-arm (clean backpressure); the drain re-arms us.
 //
 // A drain is armed per direction. rx_armed_<dir> guards against double-arming.
 
-var rx_armed_e : u16 = 0; var rx_armed_w : u16 = 0;
-var rx_armed_n : u16 = 0; var rx_armed_s : u16 = 0;
-var fwd_pending_e : u16 = 0; var fwd_pending_w : u16 = 0;
-var fwd_pending_n : u16 = 0; var fwd_pending_s : u16 = 0;
+var rx_armed = @zeros([4]u16);    // per-direction "async drain is armed"
 
 // Arm a drain on a direction: async @mov32 fabin -> rx slot, activate completion.
 fn arm_drain(dir: u16) void {
+    if (rx_armed[dir] == 1) return;
+    rx_armed[dir] = 1; rx_blocked[dir] = 0;
+    const sb = rx_next[dir] * cons.MSG_SIZE;
+    // Shared memory-DSD build+rebase over the direction's rx buffer (rx_buf_base
+    // selects the array once). Only the final async @mov32 stays 4-way, because
+    // the fabin DSD (rx_dsd_<dir>) and .activate task id are irreducibly comptime.
+    const base = rx_buf_base(dir);
+    var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_e[i] });
+    d = @set_dsd_base_addr(d, @ptrcast([*]f32, &base[sb]));
     if (dir == 0) {
-        if (rx_armed_e == 1 or fwd_pending_e == 1) return;
-        rx_armed_e = 1;
-        const sb = rx_next_e * cons.MSG_SIZE;
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_e[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_e[sb]));
         @mov32(d, rx_dsd_e, .{ .async = true, .activate = cons.rx_complete_e_id });
     } else if (dir == 1) {
-        if (rx_armed_w == 1 or fwd_pending_w == 1) return;
-        rx_armed_w = 1;
-        const sb = rx_next_w * cons.MSG_SIZE;
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_w[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_w[sb]));
         @mov32(d, rx_dsd_w, .{ .async = true, .activate = cons.rx_complete_w_id });
     } else if (dir == 2) {
-        if (rx_armed_n == 1 or fwd_pending_n == 1) return;
-        rx_armed_n = 1;
-        const sb = rx_next_n * cons.MSG_SIZE;
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_n[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_n[sb]));
         @mov32(d, rx_dsd_n, .{ .async = true, .activate = cons.rx_complete_n_id });
     } else {
-        if (rx_armed_s == 1 or fwd_pending_s == 1) return;
-        rx_armed_s = 1;
-        const sb = rx_next_s * cons.MSG_SIZE;
-        var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.MSG_SIZE} -> rx_buf_s[i] });
-        d = @set_dsd_base_addr(d, @ptrcast([*]f32, &rx_buf_s[sb]));
         @mov32(d, rx_dsd_s, .{ .async = true, .activate = cons.rx_complete_s_id });
     }
 }
 
-// Completion: a message fully arrived in the direction's rx slot. Handle it;
-// if forwarded or local, advance the slot and re-arm. If it could not be
-// forwarded (no tx buffer), mark fwd_pending and DON'T re-arm until it clears.
+// Completion: a message fully arrived in the direction's rx slot.
 fn rx_complete(dir: u16) void {
-    var sb : u16 = 0;
-    var header : u32 = 0;
-    if (dir == 0) { rx_armed_e = 0; sb = rx_next_e * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_e[sb]); }
-    else if (dir == 1) { rx_armed_w = 0; sb = rx_next_w * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_w[sb]); }
-    else if (dir == 2) { rx_armed_n = 0; sb = rx_next_n * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_n[sb]); }
-    else { rx_armed_s = 0; sb = rx_next_s * cons.MSG_SIZE; header = @bitcast(u32, rx_buf_s[sb]); }
-
+    rx_armed[dir] = 0;
+    const sb : u16 = rx_next[dir] * cons.MSG_SIZE;
+    const base = rx_buf_base(dir);
+    const header : u32 = @bitcast(u32, base[sb]);
     const plen = msg_payload_len(header);
-    // Payload pointer into this direction's rx slot (just past the header word).
-    var pay : *[cons.MSG_PAYLOAD_MAX]f32 = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_e[sb + 1]);
-    if (dir == 1) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_w[sb + 1]); }
-    else if (dir == 2) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_n[sb + 1]); }
-    else if (dir == 3) { pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_s[sb + 1]); }
-
-    const ok = handle_message(header, pay, plen);
+    const ok = handle_message(header, sb, dir, plen);
     if (ok) {
-        if (dir == 0) { rx_next_e = (rx_next_e + 1) % cons.NBUF; }
-        else if (dir == 1) { rx_next_w = (rx_next_w + 1) % cons.NBUF; }
-        else if (dir == 2) { rx_next_n = (rx_next_n + 1) % cons.NBUF; }
-        else { rx_next_s = (rx_next_s + 1) % cons.NBUF; }
+        rx_next[dir] = (rx_next[dir] + 1) % cons.NBUF_RX;
         arm_drain(dir);   // re-arm: keep listening
-    } else {
-        // couldn't forward; hold the message, mark pending. tx_complete retries.
-        if (dir == 0) { fwd_pending_e = 1; }
-        else if (dir == 1) { fwd_pending_w = 1; }
-        else if (dir == 2) { fwd_pending_n = 1; }
-        else { fwd_pending_s = 1; }
     }
+    // else: out-FIFO full; rx stays un-armed (mark_rx_blocked recorded it). The
+    // drain that frees a FIFO slot will re-arm this direction.
 }
 
 task rx_complete_e() void { rx_complete(0); }
@@ -526,65 +605,79 @@ task rx_complete_w() void { rx_complete(1); }
 task rx_complete_n() void { rx_complete(2); }
 task rx_complete_s() void { rx_complete(3); }
 
-// Retry a pending forward held in an rx slot (called from tx completion).
-fn retry_pending_fwd(dir: u16) void {
-    if (dir == 0 and fwd_pending_e == 1) {
-        const sb = rx_next_e * cons.MSG_SIZE;
-        const header = @bitcast(u32, rx_buf_e[sb]);
-        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_e[sb + 1]);
-        if (handle_message(header, pay, msg_payload_len(header))) {
-            rx_next_e = (rx_next_e + 1) % cons.NBUF; fwd_pending_e = 0; arm_drain(0);
-        }
-    } else if (dir == 1 and fwd_pending_w == 1) {
-        const sb = rx_next_w * cons.MSG_SIZE;
-        const header = @bitcast(u32, rx_buf_w[sb]);
-        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_w[sb + 1]);
-        if (handle_message(header, pay, msg_payload_len(header))) {
-            rx_next_w = (rx_next_w + 1) % cons.NBUF; fwd_pending_w = 0; arm_drain(1);
-        }
-    } else if (dir == 2 and fwd_pending_n == 1) {
-        const sb = rx_next_n * cons.MSG_SIZE;
-        const header = @bitcast(u32, rx_buf_n[sb]);
-        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_n[sb + 1]);
-        if (handle_message(header, pay, msg_payload_len(header))) {
-            rx_next_n = (rx_next_n + 1) % cons.NBUF; fwd_pending_n = 0; arm_drain(2);
-        }
-    } else if (dir == 3 and fwd_pending_s == 1) {
-        const sb = rx_next_s * cons.MSG_SIZE;
-        const header = @bitcast(u32, rx_buf_s[sb]);
-        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &rx_buf_s[sb + 1]);
-        if (handle_message(header, pay, msg_payload_len(header))) {
-            rx_next_s = (rx_next_s + 1) % cons.NBUF; fwd_pending_s = 0; arm_drain(3);
-        }
+// --- FIFO drain: push head transit messages of a DIRECTION into its tx slot --
+// One FIFO per outgoing direction (dir: 0=E,1=W,2=N,3=S) holds only messages
+// leaving that direction, so tx_has_free(dir)/tx_claim(dir) are direct. This is
+// a plain fn (not a task). A SINGLE drain task calls it for all four directions
+// — four separate tasks would overflow the PE task table, and the per-direction
+// FIFO separation (what breaks the head-to-head deadlock) lives in the BUFFERS,
+// not in having separate tasks.
+fn fifo_drain_one(dir: u16) void {
+    var guard : u16 = 0;
+    const base = fwd_fifo_base(dir);   // 4-way select once, then one shared loop
+    while (ff_count[dir] > 0 and guard < cons.FWD_FIFO_DEPTH and tx_has_free(dir)) {
+        const hb = ff_head[dir] * cons.MSG_SIZE;
+        const header = @bitcast(u32, base[hb]);
+        var pay = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &base[hb + 1]);
+        const slot = tx_claim(dir);
+        tx_launch(dir, slot, header, pay, msg_payload_len(header));
+        ff_head[dir] = (ff_head[dir] + 1) % cons.FWD_FIFO_DEPTH;
+        ff_count[dir] -= 1;
+        guard += 1;
     }
 }
+
+// Drain all four direction FIFOs, then re-arm any rx blocked on a full FIFO.
+fn fifo_drain_all() void {
+    fifo_drain_one(0); fifo_drain_one(1);
+    fifo_drain_one(2); fifo_drain_one(3);
+    if (rx_blocked[0] == 1) arm_drain(0);
+    if (rx_blocked[1] == 1) arm_drain(1);
+    if (rx_blocked[2] == 1) arm_drain(2);
+    if (rx_blocked[3] == 1) arm_drain(3);
+}
+
+task fifo_drain_task() void { fifo_drain_all(); }
 
 // Arm drains on all four directions (called at phase start to begin listening).
 fn arm_all_drains() void {
     arm_drain(0); arm_drain(1); arm_drain(2); arm_drain(3);
 }
 
-// --- TX completion: free a buffer, retry pending forwards, poke sender ---
-task tx_complete_e() void {
-    if (tx_inflight_e > 0) tx_inflight_e -= 1;
-    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
-    @activate(cons.m2l_send_task_id);
+// --- TX completion: free a buffer, push the FIFO forward --------------------
+// Freeing a tx buffer lets the drain launch the next FIFO head. (The old M2L
+// agenda sender poke, @activate(m2l_send_task_id), was removed in Step-6a; the
+// FIFO drain here remains SHARED, forwarding M2M/L2L transit messages.)
+// On a tx-slot free: first drain the forwarding FIFO (transit), then pump the
+// L2L origination agenda (emit the next originated message now that a slot is
+// free). l2l_emit_pump is inert unless l2l_active==1, so M2M/P2P are unaffected.
+// If the agenda is done and all rings are idle, l2l_emit_pump calls l2l_check_done.
+// When the agenda is already complete we still try the done-gate, because the
+// LAST originated send completing is exactly a moment the gate can pass.
+// On a tx-slot free: drain the forwarding FIFO (transit), then (if this PE has
+// an active L2L agenda) pump the next originated message. Finally ALWAYS try the
+// L2L done-gate: a transit-only leaf (l2l_active==0) must re-check here, because
+// its own cascade may be complete and only a transiting message was keeping a tx
+// ring busy — when that transit send completes, this is the moment its gate can
+// finally pass. l2l_check_done is self-guarding and one-shot, so the extra calls
+// on non-participating or already-done PEs are safe no-ops.
+// Shared body of the four tx_complete tasks, written once. CSL requires four
+// distinct task entry points (one per completion color), but each is a one-line
+// call to this common handler, collapsing 4 copies of the drain+pump+gate work.
+fn tx_complete_common(dir: u16) void {
+    if (dir == 0) { if (tx_inflight_e > 0) tx_inflight_e -= 1; }
+    else if (dir == 1) { if (tx_inflight_w > 0) tx_inflight_w -= 1; }
+    else if (dir == 2) { if (tx_inflight_n > 0) tx_inflight_n -= 1; }
+    else { if (tx_inflight_s > 0) tx_inflight_s -= 1; }
+    fifo_drain_one(dir);
+    if (l2l_active == 1) l2l_emit_pump();
+    l2l_check_done();
+    if (p2p_active == 1) p2p_emit_pump();
 }
-task tx_complete_w() void {
-    if (tx_inflight_w > 0) tx_inflight_w -= 1;
-    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
-    @activate(cons.m2l_send_task_id);
-}
-task tx_complete_n() void {
-    if (tx_inflight_n > 0) tx_inflight_n -= 1;
-    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
-    @activate(cons.m2l_send_task_id);
-}
-task tx_complete_s() void {
-    if (tx_inflight_s > 0) tx_inflight_s -= 1;
-    retry_pending_fwd(0); retry_pending_fwd(1); retry_pending_fwd(2); retry_pending_fwd(3);
-    @activate(cons.m2l_send_task_id);
-}
+task tx_complete_e() void { tx_complete_common(0); }
+task tx_complete_w() void { tx_complete_common(1); }
+task tx_complete_n() void { tx_complete_common(2); }
+task tx_complete_s() void { tx_complete_common(3); }
 
 // ===========================================================================
 // M2L LOGIC  (phase d, step 2)
@@ -634,32 +727,20 @@ fn apply_m2l_message(level: u16, tag: u16, zbase: u16, zcount: u16,
             kernels.compute_solid_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
 
             var tgt_exp = @ptrcast(*[cons.C_BUF_SIZE]f32, &l_target.*[tz * cons.C_BUF_SIZE]);
-            kernels.m2l_translate(&v_buf_m2l, src_exp, tgt_exp,
-                &m2l_offsets, &m2l_source_indices, &m2l_v_indices, &m2l_signs);
+            kernels.translate(
+                @ptrcast([*]f32, &v_buf_m2l[0]),
+                @ptrcast([*]f32, &src_exp.*[0]),
+                @ptrcast([*]f32, &tgt_exp.*[0]),
+                @ptrcast([*]u16, &m2l_offsets[0]),
+                @ptrcast([*]u16, &m2l_source_indices[0]),
+                @ptrcast([*]u16, &m2l_v_indices[0]),
+                @ptrcast([*]u32, &m2l_signs[0]));
         }
     }
 }
 
-fn get_recv_expected(level: u16) u32 {
-    if (level == 2) return recv_expected_lvl2[0];
-    if (level == 3) return recv_expected_lvl3[0];
-    return recv_expected_lvl4[0];
-}
-fn get_fwd_expected(level: u16) u32 {
-    if (level == 2) return fwd_expected_lvl2[0];
-    if (level == 3) return fwd_expected_lvl3[0];
-    return fwd_expected_lvl4[0];
-}
-fn get_num_send(level: u16) u32 {
-    if (level == 2) return num_send_lvl2[0];
-    if (level == 3) return num_send_lvl3[0];
-    return num_send_lvl4[0];
-}
-fn get_agenda_entry(level: u16, idx: u32) u32 {
-    if (level == 2) return m2l_agenda_lvl2[idx];
-    if (level == 3) return m2l_agenda_lvl3[idx];
-    return m2l_agenda_lvl4[idx];
-}
+// (Step-6a: the M2L agenda/quota getters get_recv_expected, get_fwd_expected,
+// get_num_send, get_agenda_entry were removed with the agenda driver.)
 
 // --- Dispatch: a fully-received message destined for this PE -------------
 fn process_message_local_payload(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f32, plen: u16) void {
@@ -670,8 +751,9 @@ fn process_message_local_payload(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f3
         const zbase = hdr_zbase(header);
         const zcount = hdr_zcount(header);
         apply_m2l_message(level, tag, zbase, zcount, payload);
-        m2l_recv_count += 1;
-        check_m2l_done();
+        // (Step-6a: the old M2L recv-quota bookkeeping that ran here was removed;
+        // the math above is kept. The new window-shift transport drives its own
+        // completion, grafted in the next step.)
     } else if (mtype == @as(u16, cons.MSG_M2M)) {
         const level = hdr_level(header);
         const zbase = hdr_zbase(header);
@@ -682,6 +764,7 @@ fn process_message_local_payload(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f3
         const zbase = hdr_zbase(header);
         const zcount = hdr_zcount(header);
         l2l_plane_receive(level, zbase, zcount, payload);
+        l2l_on_receive(level);
     } else {
         // MSG_P2P: a slab of remote-neighbor bodies. tag = planar (dx,dy),
         // zbase = first source cell index, zcount = number of source cells.
@@ -694,95 +777,22 @@ fn process_message_local_payload(header: u32, payload: *[cons.MSG_PAYLOAD_MAX]f3
     }
 }
 
-// Count a forwarded message (called when handle_message forwards, not local).
-fn note_forward() void {
-    m2l_fwd_count += 1;
-    check_m2l_done();
-}
-
-// --- M2L sender: inject own originations into tx-buffer slack ------------
-// Activated at phase start and after each tx completion. Sends as many of this
-// PE's agenda entries as there are free tx buffers in the needed direction.
-// Forwarding has priority (handled in tx_complete before this runs).
-fn build_m2l_header(entry: u32, level: u16) u32 {
-    // The agenda entry already packs tgt_x,tgt_y,tag,zbase,zcount in the runtime
-    // header field positions (generator uses the same shifts). We OR in the
-    // msg_type and level, which the generator leaves zero.
-    var h : u32 = entry;
-    h |= (@as(u32, cons.MSG_M2L) & cons.MASK_2BIT) << cons.SHIFT_MSG_TYPE;
-    h |= (@as(u32, level - 2) & cons.MASK_2BIT) << cons.SHIFT_LEVEL;
-    return h;
-}
-
-fn m2l_src_ptr(level: u16, zbase: u16) *[cons.MSG_PAYLOAD_MAX]f32 {
-    // Source multipoles for this message = m_lvlN starting at cube zbase. We
-    // return a pointer into the level's M buffer; since a message carries up to
-    // K contiguous cubes, this is a contiguous slice.
-    const m = m_level_ptr(level);
-    return @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &m.*[zbase * cons.C_BUF_SIZE]);
-}
-
-task m2l_send_task() void {
-    if (m2l_phase_active == 0) return;
-    const level = m2l_cur_level;
-    const nsend = get_num_send(level);
-
-    // Try to launch agenda entries until we run out or a direction is full.
-    while (m2l_send_idx < nsend) {
-        const entry = get_agenda_entry(level, m2l_send_idx);
-        const header = build_m2l_header(entry, level);
-        const tgt_x = hdr_tgt_x(header);
-        const tgt_y = hdr_tgt_y(header);
-        const zbase = hdr_zbase(header);
-        const plen = hdr_zcount(header) * cons.C_BUF_SIZE;
-        var src = m2l_src_ptr(level, zbase);
-        const sent = try_send(tgt_x, tgt_y, header, src, plen);
-        if (sent) {
-            m2l_send_idx += 1;
-        } else {
-            // direction full: stop; tx_complete will re-activate us later.
-            return;
-        }
-    }
-    // all sends for this level launched; completion is checked on each rx/fwd.
-    check_m2l_done();
-}
-
-// --- Termination check for the current M2L level ------------------------
-fn check_m2l_done() void {
-    const level = m2l_cur_level;
-    const sends_done = (m2l_send_idx >= get_num_send(level));
-    const recv_done = (m2l_recv_count >= get_recv_expected(level));
-    const fwd_done = (m2l_fwd_count >= get_fwd_expected(level));
-    if (sends_done and recv_done and fwd_done) {
-        advance_m2l_level();
-    }
-}
-
-fn advance_m2l_level() void {
-    // Reset counters and move to the next (coarser) level, or finish M2L.
-    if (m2l_cur_level > 2) {
-        m2l_cur_level -= 1;
-        m2l_recv_count = 0;
-        m2l_fwd_count = 0;
-        m2l_send_idx = 0;
-        @activate(cons.m2l_send_task_id);
-    } else {
-        m2l_phase_active = 0;
-        simprint.fmt("({d},{d}) M2L PHASE DONE", .{pe_x, pe_y});
-        phase_signal_done();   // host barrier: next phase is run_l2l_downward
-    }
-}
-
-fn start_m2l_phase() void {
-    simprint.fmt("({d},{d}) START M2L", .{pe_x, pe_y});
-    m2l_phase_active = 1;
-    m2l_cur_level = 4;      // leaf-first
-    m2l_recv_count = 0;
-    m2l_fwd_count = 0;
-    m2l_send_idx = 0;
-    @activate(cons.m2l_send_task_id);
-}
+// ===========================================================================
+// OLD M2L SEND DRIVER  -- REMOVED (Step-6a)
+// ===========================================================================
+// The agenda-based M2L send driver and its termination machinery were removed:
+//   note_forward, build_m2l_header, m2l_src_ptr, m2l_send_task, snapshot_diag,
+//   check_m2l_done, advance_m2l_level, start_m2l_phase.
+// These drove the OLD transport (originate agenda entries, track recv/fwd
+// quotas, advance levels leaf-first). The new window-shift transport replaces
+// all of this in the next step. KEPT: apply_m2l_message (the math) and the
+// shared transport (try_send / rx drains / FIFO forward / dispatcher), which
+// M2M/L2L/P2P use. run_m2l is now a no-op (see ENTRY POINTS).
+//
+// NOTE: the shared FIFO forward path (fifo_drain_one etc.) is retained because
+// M2M and L2L plane messages transit through intermediate PEs (their targets
+// are the box representative, up to cells_per_box hops away), so they DO use
+// multi-hop forwarding. It is NOT M2L-only.
 
 
 // ===========================================================================
@@ -930,14 +940,18 @@ fn m2m_z_local(child_level: u16) void {
         kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
         var child0 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_m.*[cz0 * cons.C_BUF_SIZE]);
         var par = @ptrcast(*[cons.C_BUF_SIZE]f32, &parent_m.*[pz * cons.C_BUF_SIZE]);
-        kernels.m2m_translate(&v_buf, child0, par,
-            &m2m_offsets, &m2m_child_indices, &m2m_v_indices, &m2m_signs);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &child0.*[0]), @ptrcast([*]f32, &par.*[0]),
+            @ptrcast([*]u16, &m2m_offsets[0]), @ptrcast([*]u16, &m2m_child_indices[0]),
+            @ptrcast([*]u16, &m2m_v_indices[0]), @ptrcast([*]u32, &m2m_signs[0]));
 
         geom.get_translation_vector(@as(u32, cid1), child_level, &t_vec);
         kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
         var child1 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_m.*[cz1 * cons.C_BUF_SIZE]);
-        kernels.m2m_translate(&v_buf, child1, par,
-            &m2m_offsets, &m2m_child_indices, &m2m_v_indices, &m2m_signs);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &child1.*[0]), @ptrcast([*]f32, &par.*[0]),
+            @ptrcast([*]u16, &m2m_offsets[0]), @ptrcast([*]u16, &m2m_child_indices[0]),
+            @ptrcast([*]u16, &m2m_v_indices[0]), @ptrcast([*]u32, &m2m_signs[0]));
     }
 }
 
@@ -972,14 +986,18 @@ fn l2l_z_local(parent_level: u16) void {
         geom.get_translation_vector(@as(u32, cid0), child_level, &t_vec);
         kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
         var child0 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_l.*[cz0 * cons.C_BUF_SIZE]);
-        kernels.l2l_translate(&v_buf, par, child0,
-            &l2l_offsets, &l2l_source_indices, &l2l_v_indices, &l2l_signs);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &par.*[0]), @ptrcast([*]f32, &child0.*[0]),
+            @ptrcast([*]u16, &l2l_offsets[0]), @ptrcast([*]u16, &l2l_source_indices[0]),
+            @ptrcast([*]u16, &l2l_v_indices[0]), @ptrcast([*]u32, &l2l_signs[0]));
 
         geom.get_translation_vector(@as(u32, cid1), child_level, &t_vec);
         kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
         var child1 = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_l.*[cz1 * cons.C_BUF_SIZE]);
-        kernels.l2l_translate(&v_buf, par, child1,
-            &l2l_offsets, &l2l_source_indices, &l2l_v_indices, &l2l_signs);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &par.*[0]), @ptrcast([*]f32, &child1.*[0]),
+            @ptrcast([*]u16, &l2l_offsets[0]), @ptrcast([*]u16, &l2l_source_indices[0]),
+            @ptrcast([*]u16, &l2l_v_indices[0]), @ptrcast([*]u32, &l2l_signs[0]));
     }
 }
 
@@ -1081,37 +1099,151 @@ fn m2m_plane_accumulate(level: u16, zbase: u16, zcount: u16,
 // L2L plane: the mirror. The representative sends its complete parent local
 // expansion DOWN to the other PEs of its block, which receive into l_lvl{parent}
 // (plain copy; they then do Z-local L2L to leaves). Written as send-down.
-fn l2l_plane_send_down(parent_level: u16) void {
-    // Only the representative at parent_level sends.
-    if (!geom.pe_is_plane_node(pe_x, pe_y, parent_level)) return;
-    const s : u16 = geom.cells_per_box(parent_level);
-    const nz : u16 = geom.grid_boxes(parent_level);
-    // send to the other PEs of the block (the s x s block minus self)
-    var ox : u16 = 0;
-    while (ox < s) {
-        var oy : u16 = 0;
-        while (oy < s) {
-            const tx = pe_x + ox;
-            const ty = pe_y + oy;
-            if (!(ox == 0 and oy == 0)) {
-                var zbase : u16 = 0;
-                while (zbase < nz) {
-                    var zcount : u16 = nz - zbase;
-                    if (zcount > cons.K_CUBES) zcount = cons.K_CUBES;
-                    const header = build_header(tx, ty, cons.MSG_L2L, parent_level,
-                                                0, zcount, zbase);
-                    const l = l_level_ptr(parent_level);
-                    var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &l.*[zbase * cons.C_BUF_SIZE]);
-                    const plen = zcount * cons.C_BUF_SIZE;
-                    var sent = try_send(tx, ty, header, src, plen);
-                    while (!sent) { sent = try_send(tx, ty, header, src, plen); }
-                    zbase += zcount;
-                }
-            }
-            oy += 1;
-        }
-        ox += 1;
+// The 3 non-self destinations of a broadcast phase, as plane offsets (ox,oy).
+// Phase 2 (send l_lvl2 to the other level-3 reps of this 4x4 block): offsets
+// {0,2}x{0,2}\(0,0) = (0,2),(2,0),(2,2). Phase 3 (send l_lvl3 to the 2x2 block
+// members): offsets {0,1}x{0,1}\(0,0) = (0,1),(1,0),(1,1). di in 0..2 selects.
+fn l2l_dest_offset(phase: u16, di: u16, ox: *u16, oy: *u16) void {
+    const step : u16 = if (phase == 2) 2 else 1;  // cells_per_box(child level)
+    // order: (0,step),(step,0),(step,step)
+    if (di == 0) { ox.* = 0;    oy.* = step; }
+    else if (di == 1) { ox.* = step; oy.* = 0;    }
+    else { ox.* = step; oy.* = step; }
+}
+
+// The source level and z-cube count for the current phase. Phase 2 sends l_lvl2
+// (grid_boxes(2)=4 cubes, one K-group). Phase 3 sends l_lvl3 (grid_boxes(3)=8
+// cubes, two K-groups: zbase 0 and 4). l_level_ptr gives the buffer.
+fn l2l_phase_nz(phase: u16) u16 {
+    return geom.grid_boxes(phase);    // phase 2 -> 4, phase 3 -> 8
+}
+
+// Try to emit the message at the current cursor (phase, di, zbase). Returns true
+// if launched (then advance), false if the tx ring for its direction is full
+// (no spin: return and let tx_complete retry).
+fn l2l_emit_current() bool {
+    var ox : u16 = 0; var oy : u16 = 0;
+    l2l_dest_offset(l2l_phase, l2l_di, &ox, &oy);
+    const tx = pe_x + ox;
+    const ty = pe_y + oy;
+    const nz : u16 = l2l_phase_nz(l2l_phase);
+    var zcount : u16 = nz - l2l_zbase;
+    if (zcount > cons.K_CUBES) zcount = cons.K_CUBES;
+    const header = build_header(tx, ty, cons.MSG_L2L, l2l_phase,
+                                0, zcount, l2l_zbase);
+    const l = l_level_ptr(l2l_phase);
+    var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &l.*[l2l_zbase * cons.C_BUF_SIZE]);
+    const plen = zcount * cons.C_BUF_SIZE;
+    const sent = try_send(tx, ty, header, src, plen);
+    return sent;
+}
+
+// True when no message (originated or transit) is still occupying any tx ring.
+// Used as the "all my sends have drained" condition for L2L completion, instead
+// of a per-origin counter (tx_complete cannot tell an origin from a forward).
+fn tx_all_idle() bool {
+    return (tx_inflight_e == 0) and (tx_inflight_w == 0)
+       and (tx_inflight_n == 0) and (tx_inflight_s == 0);
+}
+
+// Advance the cursor: z-blocks innermost, then di (0..2), then phase (2 -> 3).
+// For a level-2 rep the cursor spans phase 2 (3 dests) then phase 3 (3 dests).
+// For an l3-only agenda it spans phase 3 only. Sets l2l_cursor_done at the end.
+fn l2l_cursor_advance() void {
+    const nz : u16 = l2l_phase_nz(l2l_phase);
+    var zc : u16 = nz - l2l_zbase;
+    if (zc > cons.K_CUBES) zc = cons.K_CUBES;
+    l2l_zbase += zc;
+    if (l2l_zbase < nz) return;         // more z-blocks for this destination
+    l2l_zbase = 0;
+    l2l_di += 1;
+    if (l2l_di < 3) return;             // more destinations in this phase
+    l2l_di = 0;
+    // phase done: if this was phase 2 and this is NOT an l3-only agenda, go to
+    // phase 3 (only if this PE is a level-3 rep with real l_lvl3 — a level-2 rep
+    // always is, since px%4==0 => px%2==0).
+    if (l2l_phase == 2 and l2l_run_l3only == 0) {
+        l2l_phase = 3;
+        return;
     }
+    l2l_cursor_done = 1;
+}
+
+// Pump: emit while the tx rings accept, advancing the cursor each success.
+// Returns to the scheduler on the first refusal (ring full) or when done. Called
+// from the agenda start and from every tx_complete_<dir>. No busy-loop.
+fn l2l_emit_pump() void {
+    if (l2l_active == 0) return;
+    while (l2l_cursor_done == 0) {
+        const ok = l2l_emit_current();
+        if (!ok) return;            // ring full for this direction: yield
+        l2l_cursor_advance();
+    }
+    // Cursor done; if nothing is still in any tx ring, this PE may be finished.
+    if (tx_all_idle()) { l2l_check_done(); }
+}
+
+// Start the level-2 rep agenda (phase 2 then phase 3). Called from
+// run_l2l_downward on level-2 reps only. Assumes l_lvl2 is resident (from M2L).
+fn l2l_start_rep2() void {
+    l2l_active = 1;
+    l2l_run_l3only = 0;
+    l2l_phase = 2;
+    l2l_di = 0;
+    l2l_zbase = 0;
+    l2l_cursor_done = 0;
+    l2l_emit_pump();
+}
+
+// Start the level-3-only agenda (phase 3). Called from the receive path on a
+// non-l2 level-3 rep AFTER it has received l_lvl2 and done z2->l_lvl3.
+fn l2l_start_rep3() void {
+    l2l_active = 1;
+    l2l_run_l3only = 1;
+    l2l_phase = 3;
+    l2l_di = 0;
+    l2l_zbase = 0;
+    l2l_cursor_done = 0;
+    l2l_emit_pump();
+}
+
+// Per-PE completion gate. A PE is done when it has received all expected L2L
+// messages, produced its leaf l_lvl4 (z3), and drained all originated sends.
+fn l2l_check_done() void {
+    if (l2l_done_signalled == 1) return;                   // already signalled once
+    if (l2l_entered == 0) return;
+    if (l2l_recv_count < l2l_recv_expected) return;
+    if (l2l_z3_done == 0) return;
+    if (l2l_active == 1 and l2l_cursor_done == 0) return;  // still emitting
+    if (!tx_all_idle()) return;                            // sends not drained
+    l2l_done_signalled = 1;
+    phase_signal_done();
+}
+
+// Cascade step triggered by the arrival of an L2L plane message of `level`.
+//   level == 2: this PE is a non-l2 level-3 rep. It now holds l_lvl2. Do
+//     z2 -> l_lvl3, start the level-3 broadcast agenda (re-broadcast to its 2x2
+//     block), and z3 -> l_lvl4. This PE expects exactly ONE l_lvl2 message.
+//   level == 3: this PE is a plain leaf (2x2 member). l_lvl3 arrives in TWO
+//     half-messages (zbase 0 and 4, 8 cubes / K=4). Do z3 -> l_lvl4 only once
+//     BOTH halves have landed (recv_count reaches its expected 2).
+fn l2l_on_receive(level: u16) void {
+    l2l_entered = 1;
+    l2l_recv_count += 1;
+    if (level == 2) {
+        // non-l2 level-3 rep: propagate and re-broadcast.
+        l2l_z_local(2);          // l_lvl2 -> l_lvl3 (this PE's column)
+        l2l_start_rep3();        // broadcast l_lvl3 to the 2x2 block (event-driven)
+        l2l_z_local(3);          // l_lvl3 -> l_lvl4 (this PE's column)
+        l2l_z3_done = 1;
+    } else {
+        // plain leaf: wait for both l_lvl3 halves before z3.
+        if (l2l_recv_count >= l2l_recv_expected) {
+            l2l_z_local(3);      // l_lvl3 -> l_lvl4
+            l2l_z3_done = 1;
+        }
+    }
+    l2l_check_done();
 }
 
 // Receiver of an L2L plane message: plain copy into l_lvl{parent}.
@@ -1274,53 +1406,101 @@ fn p2p_send_to_neighbours() void {
     // build a slab payload buffer reusing a tx path; we construct per-message.
     const cell_stride : u16 = 1 + max_bodies_pe * 4;
     // iterate 8 plane neighbour offsets
-    var dx : i16 = -1;
-    while (dx <= 1) {
-        var dy : i16 = -1;
-        while (dy <= 1) {
-            if (!(dx == 0 and dy == 0)) {
-                const tx_i : i16 = @as(i16, pe_x) + dx;
-                const ty_i : i16 = @as(i16, pe_y) + dy;
-                if (tx_i >= 0 and tx_i < @as(i16, cells_per_side) and
-                    ty_i >= 0 and ty_i < @as(i16, cells_per_side)) {
-                    const tgt_x : u16 = @as(u16, tx_i);
-                    const tgt_y : u16 = @as(u16, ty_i);
-                    const tag : u16 = geom.get_tag_from_indices(dx, dy, 0);
-                    // split the C cells into slabs of P2P_CELLS_PER_MSG
-                    var cbase : u16 = 0;
-                    while (cbase < cells_per_side) {
-                        var ccount : u16 = cells_per_side - cbase;
-                        if (ccount > P2P_CELLS_PER_MSG) ccount = P2P_CELLS_PER_MSG;
-                        // pack slab bodies into p2p_tx_slab: per cell [count|bodies]
-                        for (@range(u16, ccount)) |ci| {
-                            const src_blk : u16 = (cbase + ci) * CELL_BLOCK;
-                            const dst_blk : u16 = ci * cell_stride;
-                            // copy count + bodies (cell_stride u32 words) as f32 bits
-                            for (@range(u16, cell_stride)) |w| {
-                                p2p_tx_slab[dst_blk + w] = @bitcast(f32, bodies_col[src_blk + w]);
-                            }
-                        }
-                        const plen : u16 = ccount * cell_stride;
-                        const header = build_header(tgt_x, tgt_y, cons.MSG_P2P, 2,
-                                                    tag, ccount, cbase);
-                        var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &p2p_tx_slab[0]);
-                        var sent = try_send(tgt_x, tgt_y, header, src, plen);
-                        while (!sent) { sent = try_send(tgt_x, tgt_y, header, src, plen); }
-                        cbase += ccount;
-                    }
-                }
-            }
-            dy += 1;
-        }
-        dx += 1;
+    // Event-driven: start the agenda (emit the first slabs), then return. The
+    // rest is emitted from tx_complete. No busy-loop.
+    p2p_active = 1;
+    p2p_dir8 = 0;
+    p2p_cbase = 0;
+    p2p_cursor_done = 0;
+    p2p_emit_pump();
+}
+
+// Map dir8 (0..7) to the 8 plane neighbour offsets (dx,dy), skipping (0,0).
+// Order: (-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1).
+fn p2p_dir_offset(d8: u16, dx: *i16, dy: *i16) void {
+    const k : u16 = if (d8 >= 4) d8 + 1 else d8;   // skip the center (index 4 of 3x3)
+    dx.* = @as(i16, k / 3) - 1;
+    dy.* = @as(i16, k % 3) - 1;
+}
+
+// Try to emit the slab at the current cursor (p2p_dir8, p2p_cbase). Returns true
+// if launched (advance) or if the neighbour is off-mesh (skip), false if the tx
+// ring is full (yield, retry from tx_complete). Packs the slab into p2p_tx_slab
+// then sends; try_send copies the payload into the tx ring, so p2p_tx_slab is
+// free to reuse on the next emit.
+fn p2p_emit_current() bool {
+    const cell_stride : u16 = 1 + max_bodies_pe * 4;
+    var dx : i16 = 0; var dy : i16 = 0;
+    p2p_dir_offset(p2p_dir8, &dx, &dy);
+    const tx_i : i16 = @as(i16, pe_x) + dx;
+    const ty_i : i16 = @as(i16, pe_y) + dy;
+    // off-mesh neighbour: nothing to send, treat as "sent" so the cursor skips it.
+    if (!(tx_i >= 0 and tx_i < @as(i16, cells_per_side) and
+          ty_i >= 0 and ty_i < @as(i16, cells_per_side))) {
+        return true;
     }
+    const tgt_x : u16 = @as(u16, tx_i);
+    const tgt_y : u16 = @as(u16, ty_i);
+    const tag : u16 = geom.get_tag_from_indices(dx, dy, 0);
+    var ccount : u16 = cells_per_side - p2p_cbase;
+    if (ccount > P2P_CELLS_PER_MSG) ccount = P2P_CELLS_PER_MSG;
+    for (@range(u16, ccount)) |ci| {
+        const src_blk : u16 = (p2p_cbase + ci) * CELL_BLOCK;
+        const dst_blk : u16 = ci * cell_stride;
+        for (@range(u16, cell_stride)) |w| {
+            p2p_tx_slab[dst_blk + w] = @bitcast(f32, bodies_col[src_blk + w]);
+        }
+    }
+    const plen : u16 = ccount * cell_stride;
+    const header = build_header(tgt_x, tgt_y, cons.MSG_P2P, 2, tag, ccount, p2p_cbase);
+    var src = @ptrcast(*[cons.MSG_PAYLOAD_MAX]f32, &p2p_tx_slab[0]);
+    return try_send(tgt_x, tgt_y, header, src, plen);
+}
+
+// Advance the cursor: cbase slabs innermost, then dir8 (0..7). Off-mesh
+// neighbours are stepped over by p2p_emit_current returning true with no send.
+fn p2p_cursor_advance() void {
+    var dx : i16 = 0; var dy : i16 = 0;
+    p2p_dir_offset(p2p_dir8, &dx, &dy);
+    const tx_i : i16 = @as(i16, pe_x) + dx;
+    const ty_i : i16 = @as(i16, pe_y) + dy;
+    const on_mesh = (tx_i >= 0 and tx_i < @as(i16, cells_per_side) and
+                     ty_i >= 0 and ty_i < @as(i16, cells_per_side));
+    if (on_mesh) {
+        var ccount : u16 = cells_per_side - p2p_cbase;
+        if (ccount > P2P_CELLS_PER_MSG) ccount = P2P_CELLS_PER_MSG;
+        p2p_cbase += ccount;
+        if (p2p_cbase < cells_per_side) return;   // more slabs for this neighbour
+    }
+    p2p_cbase = 0;
+    p2p_dir8 += 1;
+    if (p2p_dir8 >= 8) { p2p_cursor_done = 1; }
+}
+
+// Pump: emit while the tx ring accepts, advancing the cursor each success.
+// Yields on ring-full; resumes from tx_complete. Checks done when the cursor
+// is exhausted.
+fn p2p_emit_pump() void {
+    if (p2p_active == 0) return;
+    while (p2p_cursor_done == 0) {
+        const ok = p2p_emit_current();
+        if (!ok) return;            // ring full: yield
+        p2p_cursor_advance();
+    }
+    check_p2p_done();
 }
 
 fn check_p2p_done() void {
+    if (p2p_done_signalled == 1) return;                   // already unblocked once
     if (p2p_phase_active == 0) return;
+    // Require: all expected receives in, L2P done, this PE's own sends emitted
+    // (cursor exhausted) and drained from the tx rings.
+    if (p2p_active == 1 and p2p_cursor_done == 0) return;  // still emitting
+    if (!tx_all_idle()) return;                            // sends not drained
     if (p2p_recv_count >= p2p_recv_expected and l2p_done == 1) {
         p2p_phase_active = 0;
-        simprint.fmt("({d},{d}) P2P DONE", .{pe_x, pe_y});
+        p2p_active = 0;
+        p2p_done_signalled = 1;       // set BEFORE unblock (one-shot)
         fmm_done[0] = 1;
         sys_mod.unblock_cmd_stream();
     }
@@ -1364,7 +1544,6 @@ fn init_position() void {
 
 export fn run_p2m() void {
     init_position();
-    simprint.fmt("({d},{d}) P2M", .{pe_x, pe_y});
     for (@range(u16, cells_per_side * max_bodies_pe * 4)) |i| {
         forces_col[i] = 0.0;
     }
@@ -1384,18 +1563,15 @@ export fn run_p2m() void {
 export fn run_m2m_upward() void {
     // Listen on all four directions (armed async drains).
     arm_all_drains();
-    // Z-local part (all levels, local, no comm).
-    m2m_z_local(4);
-    m2m_z_local(3);
-    m2m_z_local(2);
-    m2m_z_local(1);
-    // Plane part: send this PE's partials up where it is a child-rep. The
-    // receives accumulate via the MSG_M2M dispatch.
-    if (needs_plane_send_up(4)) m2m_plane_send_up(4);
-    if (needs_plane_send_up(3)) m2m_plane_send_up(3);
-    if (needs_plane_send_up(2)) m2m_plane_send_up(2);
-    if (needs_plane_send_up(1)) m2m_plane_send_up(1);
-    simprint.fmt("({d},{d}) M2M UP", .{pe_x, pe_y});
+    // Z-local part (all levels, local, no comm). Loop over child levels 4..1
+    // as a RUNTIME loop (not 4 unrolled calls) to keep .text small: one copy of
+    // the body instead of four. Same work, far less code.
+    var lv : u16 = 4;
+    while (lv >= 1) {
+        m2m_z_local(lv);
+        if (needs_plane_send_up(lv)) m2m_plane_send_up(lv);
+        lv -= 1;
+    }
     // NOTE (completion coordination): a representative must receive all its
     // children's partials before this phase is globally safe to end. The host
     // barrier (nonblock=false) returns per-PE; correct global completion for the
@@ -1408,30 +1584,79 @@ export fn run_m2m_upward() void {
     sys_mod.unblock_cmd_stream();
 }
 
+// Step-6a: TEMPORARY NO-OP. The OLD agenda-based M2L transport was pruned and
+// the new window-shift transport is grafted in the NEXT step. For now M2L does
+// NOTHING but leave l_lvlN in a defined (zeroed) state and signal the host that
+// the phase is complete, so the host-side phase probe (fmm_done +
+// unblock_cmd_stream) sees completion and advances to run_l2l_downward. No
+// transport is performed; no messages are originated. (l_lvlN zeroed here means
+// L2L/L2P see a zero far-field contribution until the new M2L is grafted.)
 export fn run_m2l() void {
-    // Clear local expansions FIRST (M2L accumulates into l_lvlN); only then arm
-    // the drains, so an early-arriving message is not wiped by the clear.
     clear_local_expansions();
-    arm_all_drains();
-    start_m2l_phase();
-    // start_m2l_phase activates the sender; completion (check_m2l_done) will
-    // signal done when all quotas (send/recv/forward) are met across all levels.
-    // (The done-signal is fired from advance_m2l_level at the final level.)
+    phase_signal_done();   // fmm_done[0]=1 + unblock_cmd_stream, same as others
 }
 
+
 export fn run_l2l_downward() void {
-    // Plane L2L send-down (reps send to block), then Z-local L2L to leaves.
-    l2l_plane_send_down(0);
-    l2l_plane_send_down(1);
-    l2l_plane_send_down(2);
-    l2l_plane_send_down(3);
-    // Z-local downward: propagate each level's local expansion to its children.
-    l2l_z_local(1);
-    l2l_z_local(2);
-    l2l_z_local(3);
-    simprint.fmt("({d},{d}) L2L DOWN", .{pe_x, pe_y});
-    fmm_done[0] = 1;
-    sys_mod.unblock_cmd_stream();
+    // Listen on all four directions (armed async drains). L2L receives plane
+    // messages, so each PE arms its own rx drains here (idempotent).
+    arm_all_drains();
+
+    // L2L reset (this phase may run after M2L populated l_lvl2/3/4).
+    l2l_active = 0; l2l_cursor_done = 0; l2l_recv_count = 0;
+    l2l_z3_done = 0; l2l_entered = 0; l2l_done_signalled = 0;
+
+    // Role of this PE in the level-2-start cascade:
+    //   level-2 rep (px%4==0 and py%4==0): holds l_lvl2 from M2L. Originates;
+    //     expects 0 received messages.
+    //   non-l2 level-3 rep (px%2==0 and py%2==0, not an l2 rep): expects 1 msg
+    //     (its l_lvl2 from the level-2 rep), then re-broadcasts l_lvl3.
+    //   plain leaf: expects 2 msgs (the two l_lvl3 halves, 8 cubes / K=4).
+    const is_rep2 = geom.pe_is_plane_node(pe_x, pe_y, 2);
+    const is_rep3 = geom.pe_is_plane_node(pe_x, pe_y, 3);
+    if (is_rep2) {
+        l2l_recv_expected = 0;
+    } else if (is_rep3) {
+        l2l_recv_expected = 1;
+    } else {
+        l2l_recv_expected = 2;
+    }
+
+    if (is_rep2) {
+        // Seed of the cascade: l_lvl2 already resident. Propagate down this PE's
+        // own column, then broadcast (l_lvl2 to the 3 other l3-reps, then l_lvl3
+        // to its own 2x2 block). z2 must run before the phase-3 broadcast, which
+        // reads l_lvl3.
+        l2l_entered = 1;
+        l2l_z_local(2);          // l_lvl2 -> l_lvl3
+        l2l_z_local(3);          // l_lvl3 -> l_lvl4
+        l2l_z3_done = 1;
+        l2l_start_rep2();        // phase 2 (3 l3-reps) then phase 3 (own 2x2)
+        // If this rep had no sends to make (cannot happen for a real 16x16 mesh,
+        // s>1 at levels 2 and 3), the done-gate still fires via l2l_start_rep2's
+        // pump. Otherwise completion is driven by tx_complete.
+        l2l_check_done();
+    }
+    // Non-rep PEs: nothing to do now. Their cascade is triggered by the arrival
+    // of their l_lvl message(s) in l2l_on_receive. Each such PE signals done
+    // from l2l_check_done once it has received all expected messages, produced
+    // l_lvl4, and (if it re-broadcasts) drained its sends.
+    //
+    // IMPORTANT: a non-rep PE does NOT signal fmm_done here. The host D2H of
+    // fmm_done waits until every PE signals; a PE that signalled early (before
+    // receiving) would let the host advance to L2P before l_lvl4 is ready. So
+    // completion is strictly gated per-PE by l2l_check_done.
+    //
+    // DIAGNOSTIC (temporary): unblock the cmd stream even when the cascade has
+    // not completed, so the host D2H of fmm_done + l2l_dbg returns instead of
+    // hanging, letting us read which PEs are stuck and in what state. Only PEs
+    // that did NOT already signal (l2l_done_signalled==0) unblock here, to avoid
+    // a double unblock (phase_signal_done already unblocked the completed ones).
+    // fmm_done is still set ONLY on true completion, so the count reports real
+    // progress. REMOVE once L2L is verified.
+    if (l2l_done_signalled == 0) {
+        sys_mod.unblock_cmd_stream();
+    }
 }
 
 export fn run_l2p() void {
@@ -1463,7 +1688,6 @@ export fn run_l2p() void {
         z += 1;
     }
     l2p_done = 1;
-    simprint.fmt("({d},{d}) L2P", .{pe_x, pe_y});
     fmm_done[0] = 1;
     sys_mod.unblock_cmd_stream();
 }
@@ -1471,6 +1695,33 @@ export fn run_l2p() void {
 export fn run_p2p() void {
     p2p_phase_active = 1;
     p2p_recv_count = 0;
+    p2p_active = 0; p2p_cursor_done = 0; p2p_dir8 = 0; p2p_cbase = 0;
+    p2p_done_signalled = 0;
+    // Expected number of received slabs = one per on-mesh plane neighbour that
+    // sends to us. By symmetry the neighbour set is mutual: this PE receives from
+    // exactly the same on-mesh neighbours it sends to. Each neighbour sends
+    // ceil(C / P2P_CELLS_PER_MSG) slabs, so expected = n_on_mesh * slabs_per_nbr.
+    {
+        var n_nbr : u16 = 0;
+        var d8 : u16 = 0;
+        while (d8 < 8) {
+            var dxo : i16 = 0; var dyo : i16 = 0;
+            p2p_dir_offset(d8, &dxo, &dyo);
+            const nxi : i16 = @as(i16, pe_x) + dxo;
+            const nyi : i16 = @as(i16, pe_y) + dyo;
+            if (nxi >= 0 and nxi < @as(i16, cells_per_side) and
+                nyi >= 0 and nyi < @as(i16, cells_per_side)) {
+                n_nbr += 1;
+            }
+            d8 += 1;
+        }
+        var slabs_per_nbr : u16 = (cells_per_side + P2P_CELLS_PER_MSG - 1) / P2P_CELLS_PER_MSG;
+        p2p_recv_expected = @as(u32, n_nbr * slabs_per_nbr);
+    }
+    // Arm rx drains: P2P receives body slabs from plane neighbours. Previously
+    // the drains stayed armed from the old run_m2l (the last comm phase before
+    // P2P, since L2P is local); with M2L removed, P2P arms them itself. Idempotent.
+    arm_all_drains();
     // local self + Z-local interaction first (no comm)
     p2p_self_and_zlocal();
     // send body-slabs to the 8 plane neighbours; receives arrive via data tasks.
@@ -1478,6 +1729,16 @@ export fn run_p2p() void {
     // done is signalled by check_p2p_done when all expected slabs arrive AND
     // l2p_done is set. (l2p_done was set by run_l2p.)
     check_p2p_done();
+    // DIAGNOSTIC fallback, guarded by the one-shot latch so it can never cause a
+    // double unblock: if check_p2p_done already completed, p2p_done_signalled==1
+    // and this is a no-op; if the gate did NOT pass, this unblocks exactly once
+    // so the host D2H of fmm_done + l2l_dbg returns (lets us read the stuck
+    // state) instead of hanging. Exactly-one unblock per PE either way. REMOVE
+    // the fallback once P2P completion is verified to land via the gate alone.
+    if (p2p_done_signalled == 0) {
+        p2p_done_signalled = 1;
+        sys_mod.unblock_cmd_stream();
+    }
 }
 
 // --- helpers for the phase kernels ---
@@ -1490,7 +1751,7 @@ fn clear_local_expansions() void {
 }
 
 // Signal the host that this PE's current comm phase is done. Called from the
-// completion checks (advance_m2l_level final step, check_p2p_done).
+// phase kernels / completion checks (run_m2l no-op, check_p2p_done).
 fn phase_signal_done() void {
     fmm_done[0] = 1;
     sys_mod.unblock_cmd_stream();
@@ -1519,18 +1780,9 @@ var ptr_l2l_source_indices : [*]u16 = &l2l_source_indices;
 var ptr_l2l_v_indices : [*]u16 = &l2l_v_indices;
 var ptr_l2l_signs : [*]u32 = &l2l_signs;
 
-var ptr_m2l_agenda_lvl2 : [*]u32 = &m2l_agenda_lvl2;
-var ptr_m2l_agenda_lvl3 : [*]u32 = &m2l_agenda_lvl3;
-var ptr_m2l_agenda_lvl4 : [*]u32 = &m2l_agenda_lvl4;
-var ptr_num_send_lvl2 : [*]u32 = &num_send_lvl2;
-var ptr_num_send_lvl3 : [*]u32 = &num_send_lvl3;
-var ptr_num_send_lvl4 : [*]u32 = &num_send_lvl4;
-var ptr_recv_expected_lvl2 : [*]u32 = &recv_expected_lvl2;
-var ptr_recv_expected_lvl3 : [*]u32 = &recv_expected_lvl3;
-var ptr_recv_expected_lvl4 : [*]u32 = &recv_expected_lvl4;
-var ptr_fwd_expected_lvl2 : [*]u32 = &fwd_expected_lvl2;
-var ptr_fwd_expected_lvl3 : [*]u32 = &fwd_expected_lvl3;
-var ptr_fwd_expected_lvl4 : [*]u32 = &fwd_expected_lvl4;
+// (Step-6a: the OLD M2L agenda/quota host pointers were removed:
+//  ptr_m2l_agenda_lvl{2,3,4}, ptr_num_send_lvl{2,3,4},
+//  ptr_recv_expected_lvl{2,3,4}, ptr_fwd_expected_lvl{2,3,4}.)
 
 
 // ===========================================================================
@@ -1588,8 +1840,13 @@ comptime {
     @bind_local_task(tx_complete_n, cons.tx_complete_n_id);
     @bind_local_task(tx_complete_s, cons.tx_complete_s_id);
 
-    // M2L sender driver.
-    @bind_local_task(m2l_send_task, cons.m2l_send_task_id);
+    // (Step-6a: the OLD M2L sender driver task bind was removed:
+    //  @bind_local_task(m2l_send_task, cons.m2l_send_task_id). The task-id const
+    //  cons.m2l_send_task_id stays defined-but-unused in constants.csl.)
+
+    // Transit FIFO drain task (SHARED: forwards M2M/L2L transit messages, so it
+    // is kept). A SINGLE task drains all four per-direction FIFOs.
+    @bind_local_task(fifo_drain_task, cons.fifo_drain_task_id);
 
     @export_symbol(ptr_bodies_col, "ptr_bodies_col");
     @export_symbol(ptr_forces_col, "ptr_forces_col");
@@ -1616,16 +1873,7 @@ comptime {
     @export_symbol(ptr_l2l_v_indices, "ptr_l2l_v_indices");
     @export_symbol(ptr_l2l_signs, "ptr_l2l_signs");
 
-    @export_symbol(ptr_m2l_agenda_lvl2, "ptr_m2l_agenda_lvl2");
-    @export_symbol(ptr_m2l_agenda_lvl3, "ptr_m2l_agenda_lvl3");
-    @export_symbol(ptr_m2l_agenda_lvl4, "ptr_m2l_agenda_lvl4");
-    @export_symbol(ptr_num_send_lvl2, "ptr_num_send_lvl2");
-    @export_symbol(ptr_num_send_lvl3, "ptr_num_send_lvl3");
-    @export_symbol(ptr_num_send_lvl4, "ptr_num_send_lvl4");
-    @export_symbol(ptr_recv_expected_lvl2, "ptr_recv_expected_lvl2");
-    @export_symbol(ptr_recv_expected_lvl3, "ptr_recv_expected_lvl3");
-    @export_symbol(ptr_recv_expected_lvl4, "ptr_recv_expected_lvl4");
-    @export_symbol(ptr_fwd_expected_lvl2, "ptr_fwd_expected_lvl2");
-    @export_symbol(ptr_fwd_expected_lvl3, "ptr_fwd_expected_lvl3");
-    @export_symbol(ptr_fwd_expected_lvl4, "ptr_fwd_expected_lvl4");
+    // (Step-6a: the OLD M2L agenda/quota host-pointer exports were removed:
+    //  ptr_m2l_agenda_lvl{2,3,4}, ptr_num_send_lvl{2,3,4},
+    //  ptr_recv_expected_lvl{2,3,4}, ptr_fwd_expected_lvl{2,3,4}.)
 }

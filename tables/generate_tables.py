@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# gen_tables.py
+# gen_agendas25d.py
 #
 # Generator for the 2.5D routing agendas and quotas, plus the reused operator
 # math tables. Replaces the Morton-based routing of the 3D generator with the
@@ -27,7 +27,7 @@ import pickle
 P = 4
 C = 16                 # cells_per_side
 TREE_H = 4
-K_CUBES = 4
+K_CUBES = 4            # must match constants.csl K_CUBES
 N_COEFFS   = (P + 1) * (P + 2) // 2
 N_COEFFS_V = (2*P + 1) * (2*P + 2) // 2
 
