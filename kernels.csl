@@ -30,7 +30,6 @@ param M2M_N_ENTRIES: u16;
 param M2L_N_ENTRIES: u16;
 param L2L_N_ENTRIES: u16;
 param N_BUCKETS: u16;
-param P2P_PAYLOAD_SIZE: u16;
 
 const N_COEFFS: u16 = (P + 1) * (P + 2) / 2;
 const C_BUF_SIZE: u16 = N_COEFFS * 2;
@@ -115,15 +114,25 @@ fn compute_solid_harmonics(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_SIZE]f32) voi
 }
 
 
-// Same recurrence, extended to order 2P. M2L needs the translation-vector
-// expansion at double order: N_COEFFS_M2L = (2P+1)(2P+2)/2.
-fn compute_solid_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f32) void {
+// IRREGULAR solid harmonics I_l^m(v) up to order 2P, for M2L. Same buffer
+// layout as compute_solid_harmonics (m outer, l inner, interleaved re/im):
+// N_COEFFS_M2L = (2P+1)(2P+2)/2 complex values. Normalisation of the device
+// recurrences: I_l^m = (l-m)! P_l^m(cos t) e^{i m phi} / r^{l+1}. Trig-free
+// Cartesian recurrence, one sqrt and one division:
+//   I_0^0 = 1/r
+//   I_m^m = -(2m-1) (x + i y) / r^2 * I_{m-1}^{m-1}
+//   I_l^m = ((2l-1) z I_{l-1}^m - ((l-1)^2 - m^2) I_{l-2}^m) / r^2
+// Used with the M2L table of fmm_tables.gen_m2l_tables:
+//   L_j^p = (-1)^j sum_{n,k} M_n^k conj(I_{n+j}^{p+k}(v)),  v = c_t - c_s.
+// Mirrors fmm_ref.compute_irregular_harmonics_2p (same f32 operation order).
+fn compute_irregular_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f32) void {
     for (@range(u16, C_BUF_M2L_SIZE)) |i| {
         buf.*[i] = 0.0;
     }
 
-    var r2: f32 = dx * dx + dy * dy + dz * dz;
-    var mm_r: f32 = 1.0;
+    const r2: f32 = dx * dx + dy * dy + dz * dz;
+    const inv_r2: f32 = 1.0 / r2;
+    var mm_r: f32 = 1.0 / math.sqrt(r2);
     var mm_c: f32 = 0.0;
     var i_m: u16 = 0;
 
@@ -131,9 +140,9 @@ fn compute_solid_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f
 
     for (@range(i16, P2 + 1)) |m| {
         if (m > 0) {
-            var k_diag: f32 = -1.0 / (2.0 * @as(f32, m));
-            var temp_r: f32 = k_diag * (dx * mm_r - dy * mm_c);
-            var temp_c: f32 = k_diag * (dy * mm_r + dx * mm_c);
+            const k_diag: f32 = @as(f32, -(2 * m - 1)) * inv_r2;
+            const temp_r: f32 = k_diag * (dx * mm_r - dy * mm_c);
+            const temp_c: f32 = k_diag * (dy * mm_r + dx * mm_c);
             mm_r = temp_r;
             mm_c = temp_c;
         }
@@ -148,11 +157,10 @@ fn compute_solid_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f
         var prev1_c: f32 = mm_c;
 
         for (@range(i16, m + 1, P2 + 1, 1)) |l| {
-            var k_lm: f32 = 1.0 / @as(f32, l * l - m * m);
-            var z_k: f32 = (2.0 * @as(f32, l) - 1.0) * dz;
-
-            var current_r: f32 = k_lm * (z_k * prev1_r - r2 * prev2_r);
-            var current_c: f32 = k_lm * (z_k * prev1_c - r2 * prev2_c);
+            const a: f32 = @as(f32, 2 * l - 1) * dz;
+            const b: f32 = @as(f32, (l - 1) * (l - 1) - m * m);
+            const current_r: f32 = (a * prev1_r - b * prev2_r) * inv_r2;
+            const current_c: f32 = (a * prev1_c - b * prev2_c) * inv_r2;
 
             buf.*[i_m] = current_r;
             buf.*[i_m + 1] = current_c;
@@ -267,7 +275,8 @@ fn R_signed(r_buf: *[C_BUF_SIZE]f32, l: i16, m: i16, out_r: *f32, out_i: *f32) v
 // --- L2P Evaluation (potential AND forces) ---
 //
 // Potential:  phi = sum_lm w (L_r R_r - L_i R_i), w = 1 (m=0) else 2.
-// Force = -grad(phi), using the verified gradient relations (this normalization,
+// Force = +grad(phi) (the same convention as P2P and the direct N-body
+// reference: f = sum q (x_s - x_t) / r^3), using the verified gradient relations (this normalization,
 // confirmed numerically to ~1e-11):
 //   dR_l^m/dx = -0.5 R_{l-1}^{m-1} + 0.5 R_{l-1}^{m+1}
 //   dR_l^m/dy = -0.5i R_{l-1}^{m-1} - 0.5i R_{l-1}^{m+1}
@@ -330,60 +339,10 @@ fn evaluate_l2p(
     }
 
     pot.* = p_acc;
-    // Force = -grad(phi).
-    fx.* = -gx;
-    fy.* = -gy;
-    fz.* = -gz;
-}
-
-
-// --- P2P Evaluation ---
-//
-// Direct pairwise interaction between a target body and a set of remote bodies.
-//
-// TODO(evaluation-phase): verify the force sign convention. Here dx = rx - tx
-// (source minus target). This must be consistent with how the P2P contribution
-// is combined with the L2P contribution (which will use the opposite, target
-// minus source, convention) so the two add rather than cancel. Check against a
-// direct N-body reference when P2P+L2P are integrated.
-
-fn evaluate_p2p(
-    target_x: f32, target_y: f32, target_z: f32,
-    remote_bodies: *[P2P_PAYLOAD_SIZE]f32,
-    remote_count: u16,
-    fx_out: *f32, fy_out: *f32, fz_out: *f32, pot_out: *f32
-) void {
-    var fx: f32 = 0.0;
-    var fy: f32 = 0.0;
-    var fz: f32 = 0.0;
-    var pot: f32 = 0.0;
-
-    for (@range(u16, remote_count)) |i| {
-        const base: u16 = i * 4;
-        const rx: f32 = remote_bodies.*[base];
-        const ry: f32 = remote_bodies.*[base + 1];
-        const rz: f32 = remote_bodies.*[base + 2];
-        const rq: f32 = remote_bodies.*[base + 3];
-
-        const dx = rx - target_x;
-        const dy = ry - target_y;
-        const dz = rz - target_z;
-
-        const r2 = dx * dx + dy * dy + dz * dz;
-        if (r2 > 1e-10) {
-            const r_inv = 1.0 / math.sqrt(r2);
-            const r_inv3 = r_inv * r_inv * r_inv;
-
-            const f_factor = rq * r_inv3;
-            fx += f_factor * dx;
-            fy += f_factor * dy;
-            fz += f_factor * dz;
-            pot += rq * r_inv;
-        }
-    }
-
-    fx_out.* = fx;
-    fy_out.* = fy;
-    fz_out.* = fz;
-    pot_out.* = pot;
+    // Force = +grad(phi): the convention of P2P (apply in pe.csl) and of the
+    // direct N-body reference. (It returned -grad(phi) before, i.e. the far
+    // field had the opposite sign of the near field.)
+    fx.* = gx;
+    fy.* = gy;
+    fz.* = gz;
 }

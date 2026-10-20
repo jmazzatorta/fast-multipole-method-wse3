@@ -2,8 +2,8 @@
 //
 // Instantiates the C x C PE mesh (NO Morton, NO 64x64 blow-up). Each PE(x,y) is
 // a plane position hosting a column of C cells along Z. Assigns the 8 routing
-// colors (4 directions x 2 parity) with dimension-order XY fabric routes, and
-// exports the symbols the host memcpy's into each PE.
+// colors (4 directions x 2 parity) used by the serpentine software-routed
+// transport, and exports the symbols the host memcpy's into each PE.
 //
 // Forwarding is SOFTWARE (store-and-forward in the PE core), so the fabric needs
 // no pass-through routes: every color is either RAMP->dir (a PE originating onto
@@ -70,13 +70,12 @@ layout {
     // parity params), following the working WSE-3 reference pattern with
     // @set_local_color_config. Nothing to configure here at the layout level.
 
-    // --- Exported phase entry points (host calls in sequence, barriers between) ---
+    // --- Exported entry points (host calls them in sequence; see pe.csl) ---
+    // run_p2m, then run_pass once per serpentine pass (8, the last is P2P),
+    // then run_l2p.
     @export_name("run_p2m", fn()void);
-    @export_name("run_m2m_upward", fn()void);
-    @export_name("run_m2l", fn()void);
-    @export_name("run_l2l_downward", fn()void);
+    @export_name("run_pass", fn()void);
     @export_name("run_l2p", fn()void);
-    @export_name("run_p2p", fn()void);
 
     @export_name("ptr_fmm_done", [*]u32, true);
 
@@ -103,16 +102,10 @@ layout {
     @export_name("ptr_l2l_v_indices", [*]u16, true);
     @export_name("ptr_l2l_signs", [*]u32, true);
 
-    @export_name("ptr_m2l_agenda_lvl2", [*]u32, true);
-    @export_name("ptr_m2l_agenda_lvl3", [*]u32, true);
-    @export_name("ptr_m2l_agenda_lvl4", [*]u32, true);
-    @export_name("ptr_num_send_lvl2", [*]u32, true);
-    @export_name("ptr_num_send_lvl3", [*]u32, true);
-    @export_name("ptr_num_send_lvl4", [*]u32, true);
-    @export_name("ptr_recv_expected_lvl2", [*]u32, true);
-    @export_name("ptr_recv_expected_lvl3", [*]u32, true);
-    @export_name("ptr_recv_expected_lvl4", [*]u32, true);
-    @export_name("ptr_fwd_expected_lvl2", [*]u32, true);
-    @export_name("ptr_fwd_expected_lvl3", [*]u32, true);
-    @export_name("ptr_fwd_expected_lvl4", [*]u32, true);
+    // Serpentine M2L: per-PE pass table (host-built), diagnostics, and the leaf
+    // local expansions for verification.
+    @export_name("ptr_serp_tab", [*]u16, true);
+    @export_name("ptr_serp_stats", [*]u32, true);
+    @export_name("ptr_serp_stats_all", [*]u32, true);
+    @export_name("ptr_l_lvl4", [*]f32, true);
 }
