@@ -640,7 +640,7 @@ def _m2l_mask(level, d, mode):
 
 
 def m2l_level(m, level, l_out=None, mode="correct", sign=+1, ops="csl",
-              tables=None):
+              tables=None, chunk=1 << 20):
     """Apply M2L at `level` into l_out (zeros if None) and return it.
 
     m: (n,n,n,C_BUF_SIZE) multipoles at `level`. For every interacting
@@ -648,6 +648,10 @@ def m2l_level(m, level, l_out=None, mode="correct", sign=+1, ops="csl",
     with d = sign * (t - s) (sign=+1 is the device convention: dz = tz - sz in
     apply_m2l_message). Accumulation order into a target: offsets in the
     lexicographic order of interaction_offsets().
+
+    The pairs are translated offset by offset, in pieces of at most `chunk`
+    pairs (memory ~ chunk * 0.7 KiB). translate() works pair by pair and a
+    target appears once per offset, so the result does not depend on `chunk`.
 
     ops='csl'  : device as written (compute_solid_harmonics_2p + device m2l table)
     ops='fixed': irregular harmonics + corrected table (gen_m2l_table_fixed)"""
@@ -662,38 +666,24 @@ def m2l_level(m, level, l_out=None, mode="correct", sign=+1, ops="csl",
     if l_out is None:
         l_out = np.zeros((n, n, n, C_BUF_SIZE), dtype=f32)
     bs = BOX_SIZE_AT_LEVEL[level]
-    offs = interaction_offsets(level)
-    # Gather every (target, source) pair of every offset into one batch.
-    t_list, s_list, v_list, seg = [], [], [], []
-    for d in offs:
+    for d in interaction_offsets(level):
         mask = _m2l_mask(level, d, mode)
         if not mask.any():
             continue
-        t = np.argwhere(mask)
-        s = t - np.asarray(d)[None, :]
         dd = [sign * x for x in d]
         fx, fy, fz = get_physical_distances(dd[0], dd[1], dd[2], bs)
         v = harm(np.array([fx], f32), np.array([fy], f32),
                  np.array([fz], f32))[0]
-        t_list.append(t)
-        s_list.append(s)
-        v_list.append(np.broadcast_to(v, (len(t), C_BUF_M2L_SIZE)))
-        seg.append(len(t))
-    if not t_list:
-        return l_out
-    T = np.concatenate(t_list)
-    S = np.concatenate(s_list)
-    V = np.concatenate(v_list)
-    src = m[S[:, 0], S[:, 1], S[:, 2]]
-    acc = np.zeros((len(T), C_BUF_SIZE), dtype=f32)
-    # translate() adds its per-coefficient accumulator into the target; doing
-    # it on a zero buffer then adding into l_out reproduces "tgt += accum".
-    translate(V, src, acc, tb)
-    start = 0
-    for ln in seg:
-        tt = T[start:start + ln]
-        l_out[tt[:, 0], tt[:, 1], tt[:, 2]] += acc[start:start + ln]
-        start += ln
+        T = np.argwhere(mask)
+        S = T - np.asarray(d)[None, :]
+        for a in range(0, len(T), chunk):
+            tt, ss = T[a:a + chunk], S[a:a + chunk]
+            acc = np.zeros((len(tt), C_BUF_SIZE), dtype=f32)
+            # translate() adds its per-coefficient accumulator into the
+            # target; doing it on a zero buffer then adding into l_out
+            # reproduces "tgt += accum".
+            translate(v, m[ss[:, 0], ss[:, 1], ss[:, 2]], acc, tb)
+            l_out[tt[:, 0], tt[:, 1], tt[:, 2]] += acc
     return l_out
 
 

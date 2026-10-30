@@ -65,55 +65,65 @@ class Tee:
 # Memcpy helpers (appliance SDK)
 # ===========================================================================
 # rect = (W, H): the program rectangle in PEs. Host tensors are (H, W, n),
-# indexed [fy, fx] (ROW_MAJOR).
-def broadcast(rect, arr):
-    """Replicate a 1D array to every PE: shape (H, W, len)."""
-    n = arr.shape[0]
-    return np.broadcast_to(arr, (rect[1], rect[0], n)).copy()
+# indexed [fy, fx] (ROW_MAJOR). Every transfer is split into bands of whole
+# PE rows of at most MEMCPY_MAX_BYTES each: one memcpy message must stay
+# below the gRPC limit of 2 GiB (an mp_ent push at 512x512 PEs is 2.4 GB).
+MEMCPY_MAX_BYTES = 256 << 20
+
+def _row_bands(rect, n):
+    """(y0, rows) bands of whole PE rows, each <= MEMCPY_MAX_BYTES (4-byte
+    host words, n per PE)."""
+    rows = max(1, MEMCPY_MAX_BYTES // (4 * n * rect[0]))
+    return [(y, min(rows, rect[1] - y)) for y in range(0, rect[1], rows)]
+
+def _h2d(runner, sym, band, rect, n, data_type):
+    """band(y0, rows) -> (rows, W, n) u32 host data of those PE rows."""
+    for y0, h in _row_bands(rect, n):
+        t = np.ascontiguousarray(band(y0, h), dtype=np.uint32)
+        runner.memcpy_h2d(sym, t.ravel(), 0, y0, rect[0], h, n,
+                          streaming=False, data_type=data_type,
+                          nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+
+def _d2h(runner, sym, rect, n, dtype):
+    out = np.zeros((rect[1], rect[0], n), dtype=dtype)
+    for y0, h in _row_bands(rect, n):
+        part = np.zeros(h * rect[0] * n, dtype=dtype)
+        runner.memcpy_d2h(part, sym, 0, y0, rect[0], h, n,
+                          streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
+                          nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+        out[y0:y0 + h] = part.reshape(h, rect[0], n)
+    return out
 
 def h2d_bcast_u16(runner, sym, arr_u16, rect):
-    """u16 device buffer, broadcast. Host tensor is u32 zero-extended,
-    pushed as MEMCPY_16BIT."""
-    n = arr_u16.shape[0]
-    t = broadcast(rect, arr_u16.astype(np.uint32))
-    runner.memcpy_h2d(sym, t.ravel(), 0, 0, rect[0], rect[1], n,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+    """u16 device buffer, broadcast to every PE. Host words are u32
+    zero-extended, pushed as MEMCPY_16BIT."""
+    a = arr_u16.astype(np.uint32)
+    _h2d(runner, sym, lambda y0, h: np.broadcast_to(a, (h, rect[0], len(a))),
+         rect, len(a), MemcpyDataType.MEMCPY_16BIT)
 
 def h2d_bcast_u32(runner, sym, arr_u32, rect):
     """u32 device buffer, broadcast (e.g. packed signs)."""
-    n = arr_u32.shape[0]
-    t = broadcast(rect, arr_u32.astype(np.uint32))
-    runner.memcpy_h2d(sym, t.ravel(), 0, 0, rect[0], rect[1], n,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+    a = arr_u32.astype(np.uint32)
+    _h2d(runner, sym, lambda y0, h: np.broadcast_to(a, (h, rect[0], len(a))),
+         rect, len(a), MemcpyDataType.MEMCPY_32BIT)
 
 def h2d_per_pe_u32(runner, sym, tensor, rect, words_per_pe):
-    runner.memcpy_h2d(sym, tensor.ravel(), 0, 0, rect[0], rect[1], words_per_pe,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+    t = tensor.reshape(rect[1], rect[0], words_per_pe)
+    _h2d(runner, sym, lambda y0, h: t[y0:y0 + h], rect, words_per_pe,
+         MemcpyDataType.MEMCPY_32BIT)
 
 def h2d_per_pe_u16(runner, sym, tensor_u16, rect, words_per_pe):
-    """u16 device buffer, per-PE data. Host tensor (H, W, n) is u32
-    zero-extended, pushed as MEMCPY_16BIT."""
-    t = np.ascontiguousarray(tensor_u16.astype(np.uint32))
-    runner.memcpy_h2d(sym, t.ravel(), 0, 0, rect[0], rect[1], words_per_pe,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+    """u16 device buffer, per-PE data. Host words are u32 zero-extended,
+    pushed as MEMCPY_16BIT."""
+    t = tensor_u16.reshape(rect[1], rect[0], words_per_pe)
+    _h2d(runner, sym, lambda y0, h: t[y0:y0 + h], rect, words_per_pe,
+         MemcpyDataType.MEMCPY_16BIT)
 
 def d2h_per_pe_u32(runner, sym, rect, words_per_pe):
-    out = np.zeros(rect[0] * rect[1] * words_per_pe, dtype=np.uint32)
-    runner.memcpy_d2h(out, sym, 0, 0, rect[0], rect[1], words_per_pe,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
-    return out.reshape(rect[1], rect[0], words_per_pe)
+    return _d2h(runner, sym, rect, words_per_pe, np.uint32)
 
 def d2h_per_pe_f32(runner, sym, rect, words_per_pe):
-    out = np.zeros(rect[0] * rect[1] * words_per_pe, dtype=np.float32)
-    runner.memcpy_d2h(out, sym, 0, 0, rect[0], rect[1], words_per_pe,
-                      streaming=False, data_type=MemcpyDataType.MEMCPY_32BIT,
-                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
-    return out.reshape(rect[1], rect[0], words_per_pe)
+    return _d2h(runner, sym, rect, words_per_pe, np.float32)
 
 
 # ===========================================================================
@@ -190,19 +200,36 @@ def build_bodies_tensor(bodies, C, max_bodies_pe):
         flat[fy, fx, zl * CELL_BLOCK] = np.uint32(k)
     return flat, col_len, CELL_BLOCK
 
-def direct_nbody(bodies):
-    N = len(bodies)
+def check_targets(n, sample):
+    """Indices of the target bodies of the direct-sum checks: all n when
+    sample is 0 or >= n, else `sample` of them drawn with a fixed seed."""
+    if sample <= 0 or sample >= n:
+        return np.arange(n)
+    return np.sort(np.random.default_rng(12345).choice(n, sample, replace=False))
+
+
+def _target_blocks(targets, n):
+    """Split `targets` into blocks of about 2**24 / n targets, so a block of
+    target x source f64 arrays stays near 128 MiB."""
+    step = max(1, (1 << 24) // max(n, 1))
+    return [targets[a:a + step] for a in range(0, len(targets), step)]
+
+
+def direct_nbody(bodies, targets):
+    """Direct sum (f64) of the force and potential on bodies[targets] from all
+    other bodies. Returns F (len(targets), 3) and pot (len(targets),)."""
     pos = bodies[:, :3].astype(np.float64)
     q = bodies[:, 3].astype(np.float64)
-    F = np.zeros((N, 3)); pot = np.zeros(N)
-    for i in range(N):
-        d = pos - pos[i]
-        r2 = (d * d).sum(axis=1)
-        r2[i] = np.inf
+    F = np.zeros((len(targets), 3)); pot = np.zeros(len(targets))
+    a = 0
+    for tb in _target_blocks(targets, len(bodies)):
+        d = pos[None, :, :] - pos[tb, None, :]
+        r2 = (d * d).sum(axis=2)
+        r2[np.arange(len(tb)), tb] = np.inf
         rinv = 1.0 / np.sqrt(r2)
-        rinv3 = rinv ** 3
-        F[i] = (q[:, None] * rinv3[:, None] * d).sum(axis=0)
-        pot[i] = (q * rinv).sum()
+        F[a:a + len(tb)] = np.einsum("tn,tnc->tc", q * rinv ** 3, d)
+        pot[a:a + len(tb)] = (q * rinv).sum(axis=1)
+        a += len(tb)
     return F, pot
 
 
@@ -323,12 +350,13 @@ def compare_leaf(l_dev, ref, C, what):
     return ok
 
 
-def physics_check_m2l_leaf(l_dev, bodies, C, max_bodies_pe):
+def physics_check_m2l_leaf(l_dev, bodies, C, max_bodies_pe, sample):
     """Physical check of the device leaf-level M2L, independent of fmm_ref's
     M2L: potential from L2P of the DEVICE l_leaf (after the leaf M2L pass, so
     it holds only leaf-level interactions) vs the direct sum over the bodies of
-    the leaf interaction-list cells (not adjacent, parents adjacent). Measured
-    at C=16, P=4: median ~4e-5, max ~2.5e-3."""
+    the leaf interaction-list cells (not adjacent, parents adjacent), on the
+    target bodies of check_targets(sample). Measured at C=16, P=4: median
+    ~4e-5, max ~2.5e-3."""
     import fmm_ref
     binned = fmm_ref.bin_bodies(bodies, max_bodies=max_bodies_pe)
     where = binned[2]
@@ -336,18 +364,26 @@ def physics_check_m2l_leaf(l_dev, bodies, C, max_bodies_pe):
     l4 = np.transpose(l_dev.reshape(C, C, C, fmm_ref.C_BUF_SIZE),
                       (1, 0, 2, 3)).astype(np.float32)
     out = fmm_ref.l2p(binned, l4)
-    pot_dev = np.array([out[w[0], w[1], w[2], w[3], 3] for w in where], dtype=np.float64)
+    tg = check_targets(len(bodies), sample)
+    w = where[tg]
+    pot_dev = out[w[:, 0], w[:, 1], w[:, 2], w[:, 3], 3].astype(np.float64)
     cell = 512.0 / C
     ci = (bodies[:, :3] // cell).astype(int).clip(0, C - 1)
     pos = bodies[:, :3].astype(np.float64)
-    pot_dir = np.zeros(len(bodies))
-    for i in range(len(bodies)):
-        m = (np.max(np.abs(ci - ci[i]), axis=1) >= 2) & \
-            (np.max(np.abs(ci // 2 - ci[i] // 2), axis=1) <= 1)
-        pot_dir[i] = (bodies[m, 3] / np.linalg.norm(pos[m] - pos[i], axis=1)).sum()
+    q = bodies[:, 3].astype(np.float64)
+    pot_dir = np.zeros(len(tg))
+    a = 0
+    for tb in _target_blocks(tg, len(bodies)):
+        dc = np.abs(ci[None, :, :] - ci[tb, None, :]).max(axis=2)
+        dp = np.abs(ci[None, :, :] // 2 - ci[tb, None, :] // 2).max(axis=2)
+        r = np.linalg.norm(pos[None, :, :] - pos[tb, None, :], axis=2)
+        pot_dir[a:a + len(tb)] = np.where((dc >= 2) & (dp <= 1),
+                                          q / np.where(dc >= 2, r, 1.0), 0.0).sum(axis=1)
+        a += len(tb)
     rel = np.abs(pot_dev - pot_dir) / np.abs(pot_dir)
     ok = bool(np.median(rel) < 1e-3 and rel.max() < 1e-2)
-    print(f"  physics M2L{fmm_ref.TREE_H} (device l_leaf -> L2P vs direct sum on the leaf list): "
+    print(f"  physics M2L{fmm_ref.TREE_H} (device l_leaf -> L2P vs direct sum on the leaf list, "
+          f"{len(tg)}/{len(bodies)} target bodies): "
           f"potential rel err median {np.median(rel):.2e} max {rel.max():.2e}"
           f"  -> {'OK' if ok else 'FAIL'}")
     return ok
@@ -368,15 +404,18 @@ def device_forces_per_body(forces_3d, bodies, C, max_bodies_pe):
     return out
 
 
-def physics_check_forces(forces_3d, bodies, C, max_bodies_pe):
+def physics_check_forces(forces_3d, bodies, C, max_bodies_pe, sample):
     """Device forces/potentials (complete FMM: far field + P2P near field) vs
-    the direct N-body sum. Expected for P=4: force rel err median ~1e-3."""
-    dev = device_forces_per_body(forces_3d, bodies, C, max_bodies_pe)
-    Fr, pr = direct_nbody(bodies)
+    the direct N-body sum, on the target bodies of check_targets(sample).
+    Expected for P=4: force rel err median ~1e-3."""
+    tg = check_targets(len(bodies), sample)
+    dev = device_forces_per_body(forces_3d, bodies, C, max_bodies_pe)[tg]
+    Fr, pr = direct_nbody(bodies, tg)
     ferr = np.linalg.norm(dev[:, :3] - Fr, axis=1) / (np.linalg.norm(Fr, axis=1) + 1e-30)
     perr = np.abs(dev[:, 3] - pr) / (np.abs(pr) + 1e-30)
     ok = bool(np.median(ferr) < 1e-2 and np.median(perr) < 1e-3)
-    print(f"  physics forces (device FMM vs direct N-body): force rel err "
+    print(f"  physics forces (device FMM vs direct N-body, {len(tg)}/{len(bodies)} "
+          f"target bodies): force rel err "
           f"median {np.median(ferr):.2e} rms {np.sqrt((ferr**2).mean()):.2e} max {ferr.max():.2e}; "
           f"pot median {np.median(perr):.2e} max {perr.max():.2e}  -> {'OK' if ok else 'FAIL'}")
     return ok
@@ -398,9 +437,10 @@ def expected_transport(k, max_bodies_pe):
     return exp, ["rx", "relays", "tx", "port-arr"]
 
 
-def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe):
+def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe, sample):
     """pass_stats: pass -> (H, W, 8); leaf_checkpoints: pass -> per-PE l_leaf
-    (H, W, ZP*C_BUF_SIZE)."""
+    (H, W, ZP*C_BUF_SIZE); sample: target bodies of the direct-sum check
+    (check_targets)."""
     import fmm_passes as T
     print("\n--- VERIFICATION: passes (all-static transport) ---")
     allok = True
@@ -435,7 +475,7 @@ def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe):
                 # device math: M2L corrected (irregular harmonics), see fmm_tables
                 ref = fmm_ref.m2l_leaf_only(binned, ops="fixed")
                 allok &= compare_leaf(leaf, ref, C, f"after {name}")
-                allok &= physics_check_m2l_leaf(leaf, bodies, C, max_bodies_pe)
+                allok &= physics_check_m2l_leaf(leaf, bodies, C, max_bodies_pe, sample)
             else:
                 # Whole pipeline (M2M, M2L at every level, L2L) vs the
                 # reference with the device math (corrected M2L and L2L).
@@ -531,10 +571,19 @@ def main():
     parser.add_argument("--nbodies", type=int, default=2000,
                         help="random bodies when --bodies is not given")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--memcpy-max-kib", type=int, default=256 << 10,
+                        help="largest memcpy transfer; bigger ones are split into "
+                             "bands of PE rows (gRPC refuses messages >= 2 GiB)")
+    parser.add_argument("--check-sample", type=int, default=4000,
+                        help="target bodies of the direct-sum physics checks, drawn "
+                             "with a fixed seed (0 = all bodies; the cost is "
+                             "O(sample * N))")
     parser.add_argument("--verify-only", default=None, metavar="RUN_DIR",
                         help="re-run the verification on RUN_DIR/device_data.npz "
                              "(no device needed)")
     args = parser.parse_args()
+    global MEMCPY_MAX_BYTES
+    MEMCPY_MAX_BYTES = args.memcpy_max_kib << 10
     if args.verify_only:
         d = np.load(os.path.join(args.verify_only, "device_data.npz"))
         # runs saved before GEN have no order_p (P = 4), before G no zp (ZP = C)
@@ -545,10 +594,11 @@ def main():
         # leaf_<k>: l_leaf after pass k (l4_<k> in runs saved before GEN)
         cp = {int(k.split("_")[1]): d[k] for k in d.files
               if k.startswith("leaf_") or k.startswith("l4_")}
-        ok = verify_passes(ps, cp, d["bodies"], int(d["C"]), int(d["max_bodies_pe"]))
+        ok = verify_passes(ps, cp, d["bodies"], int(d["C"]), int(d["max_bodies_pe"]),
+                           args.check_sample)
         if "forces" in d.files:
             ok &= physics_check_forces(d["forces"], d["bodies"], int(d["C"]),
-                                       int(d["max_bodies_pe"]))
+                                       int(d["max_bodies_pe"]), args.check_sample)
         if "tsc" in d.files:
             print_tsc(d["tsc"])
         sys.exit(0 if ok else 1)
@@ -813,7 +863,8 @@ def main():
 
     if forces_3d is not None and STEP_L2P in completed:
         print("\n--- physics: device forces (complete FMM) vs direct N-body ---")
-        if not physics_check_forces(forces_3d, bodies, C, max_bodies_pe) and err is None:
+        if not physics_check_forces(forces_3d, bodies, C, max_bodies_pe,
+                                    args.check_sample) and err is None:
             err = "force physics check failed"
 
     if pass_stats:
@@ -826,7 +877,8 @@ def main():
                  **({"forces": forces_3d} if forces_3d is not None and STEP_L2P in completed else {}),
                  **({"tsc": tsc} if tsc is not None else {}),
                  **({"fmm_done": stuck_done} if stuck_done is not None else {}))
-        ok = verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe)
+        ok = verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe,
+                          args.check_sample)
         if not ok and err is None:
             err = "verification failed"
 
