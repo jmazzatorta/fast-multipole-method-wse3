@@ -1,0 +1,93 @@
+// geometry.csl - 2.5D mapping geometry (device side)
+//
+// Replaces all Morton logic of the 3D version with a DIRECT CARTESIAN mapping.
+//
+// Founding principle of 2.5D:
+//   - The plane columns (x, y), C x C, represent the (X, Y) plane.
+//   - Each column holds C leaf cells stacked along Z, cut into chunks of ZP
+//     cells, one per PE (z split, see pe.csl and pe_map.py; ZP = C: one PE per
+//     column).
+//   - Plane = communication; Z inside a PE = local (SRAM, zero hops).
+//
+// A leaf cell's identity is (x, y, z), each in [0, C-1]. There is no Morton
+// code: the Cartesian coordinates ARE the identity, and for (x,y) they are
+// already the physical address on the wafer.
+//
+// This module is the device-side mirror of geometry25d.py. Every function here
+// has a verified Python counterpart; the two must stay in step.
+//
+// Two views of the same object, never in conflict:
+//   - ALGEBRAIC 3D view : a tree node is a box (bx,by,bz); translation vectors
+//                         are fully 3D (correct, non-degenerate multipoles).
+//                         Used by the M2M/M2L/L2L operators, reused unchanged.
+//   - PLANE + Z view    : of the three axes, X,Y live on the plane
+//                         (communication), Z lives in the column (local
+//                         aggregation). Used by the router.
+
+param prob_range : f32;
+param cells_per_side : u16;   // C: domain side in leaf cells
+param TREE_H : u16;           // number of levels above the leaves; C == 2**TREE_H
+
+
+// ===========================================================================
+// RELATIVE DISTANCES
+// ===========================================================================
+// Convert relative cell-index offsets into physical distances at a given box
+// size. box_size is the leaf-cell edge for a leaf-level interaction, or the box
+// edge at the relevant level for a coarser one.
+fn get_physical_distances(dx_idx: i16, dy_idx: i16, dz_idx: i16, box_size: f32,
+                          dist_x: *f32, dist_y: *f32, dist_z: *f32) void {
+    dist_x.* = @as(f32, dx_idx) * box_size;
+    dist_y.* = @as(f32, dy_idx) * box_size;
+    dist_z.* = @as(f32, dz_idx) * box_size;
+}
+
+
+// ===========================================================================
+// OCTREE TRANSLATION VECTOR  (reused unchanged from 3D)
+// ===========================================================================
+// Vector from a child box centre to its parent box centre. child_id bits:
+//   bit 0 = X, bit 1 = Y, bit 2 = Z.
+// This is octree geometry, independent of the PE mesh: the tree is the same in
+// 2.5D. It yields a full 3D vector (all three axes), which is exactly right:
+// the M2M/L2L algebra stays 3D. The plane/Z split needed for routing is a
+// separate projection (plane bits vs z bit of child_id), not a change here.
+fn get_translation_vector(child_id: u32, l: u16, out_vec: *[3]f32) void {
+    // `l` is a runtime level (varies across the M2M/L2L passes), so it must not
+    // be a comptime parameter. The shift below is an ordinary runtime shift.
+    const power_of_2 = @as(f32, @as(u32, 1) << l);
+    const half_child_size = (prob_range / power_of_2) * 0.5;
+
+    out_vec.*[0] = if (child_id & 1 == 0) half_child_size else -half_child_size;
+    out_vec.*[1] = if (child_id & 2 == 0) half_child_size else -half_child_size;
+    out_vec.*[2] = if (child_id & 4 == 0) half_child_size else -half_child_size;
+}
+
+
+// ===========================================================================
+// BOX GEOMETRY  (new: Cartesian, replaces Morton)
+// ===========================================================================
+// At level `level` (0 = root, TREE_H = leaves), a box spans
+// cells_per_box = 2**(TREE_H - level) leaf cells per side. The number of boxes
+// per side is 2**level.
+
+// Side (in leaf cells) of a box at the given level.
+fn cells_per_box(level: u16) u16 {
+    return @as(u16, 1) << (TREE_H - level);
+}
+
+// ===========================================================================
+// BOX -> PLANE PROJECTION  (new: the heart of the plane+Z view)
+// ===========================================================================
+// A box (bx,by,bz) at `level` covers, on the plane, the PE block
+//   pe_x in [bx*s, bx*s + s), pe_y in [by*s, by*s + s),  s = cells_per_box.
+// The bz coordinate does NOT touch the plane: it selects which cells of the
+// column (in SRAM) belong to the box. A 2x2x2 box of leaves (level TREE_H-1,
+// s=2) maps to 4 plane PEs, each holding 2 Z cells.
+
+// Is PE(pe_x,pe_y) the representative of some box at `level`? True iff it is
+// aligned to the box grid. Replaces is_pe_node_for_level (no Morton stride).
+fn pe_is_plane_node(pe_x: u16, pe_y: u16, level: u16) bool {
+    const s: u16 = cells_per_box(level);
+    return (pe_x % s == 0) and (pe_y % s == 0);
+}

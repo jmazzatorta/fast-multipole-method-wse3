@@ -1,0 +1,136 @@
+// layout.csl - 2.5D FMM, TOP-LEVEL LAYOUT (the root)
+//
+// Instantiates the PE rectangle of the z-split mapping (pe_map.py): every plane
+// column (x, y) of C leaf cells is cut into NK = C / ZP chunks of ZP cells, one
+// per PE; the NK PEs of a column form a BW x BH block (BW = 2**blk_lbw, BH =
+// 2**blk_lbh, BW * BH = NK) at fabric (x * BW, y * BH), chunks in snake order
+// (row 0 left->right, row 1 right->left, ...). Rectangle (C * BW) x (C * BH).
+// ZP = C gives NK = 1: the C x C mesh, one PE per column. Each PE exports the
+// symbols the host memcpy's into it.
+//
+// Communication is the all-static transport (xport.csl, lane.csl): four
+// static neighbour lanes on colors 3..10, routes set at comptime by lane.csl
+// from the column / row parity passed below; no route to declare here. memcpy
+// uses colors 0 / 1 (streaming) and 20..23.
+
+// --- Domain / mesh parameters ---
+param cells_per_side : u16;             // C (compile-time param; appears in out.json)
+const prob_range     : f32 = 512.0;     // physical domain edge
+param max_bodies_pe : u16;              // max bodies per leaf cell
+// Tree depth and expansion order, set by appliance_compile.py (with the operator
+// table sizes of fmm_tables.table_sizes() for that order).
+param tree_h : u16;                     // H = log2(C)
+param order_p : u16;                    // P
+param m2m_n_entries : u16;
+param m2l_n_entries : u16;
+param l2l_n_entries : u16;
+// mp_ent_cap = size of the per-PE send table of the transport, set by
+// appliance_compile.py (zmp_tables.py) and read back from out.json.
+param mp_ent_cap : u16;
+// Z split (pe_map.py): ZP = 2**zp_log leaf cells per PE, block 2**blk_lbw x
+// 2**blk_lbh PEs per column, 2**(blk_lbw + blk_lbh) = C / ZP.
+param zp_log : u16;
+param blk_lbw : u16;
+param blk_lbh : u16;
+const cell_size : f32 = prob_range / @as(f32, cells_per_side);
+
+// --- Memcpy streaming colors (host <-> device) ---
+param MEMCPY_H2D_ID : i16;
+param MEMCPY_D2H_ID : i16;
+
+// --- Program rectangle ---
+const rect_w : u16 = cells_per_side << blk_lbw;
+const rect_h : u16 = cells_per_side << blk_lbh;
+
+// --- Memcpy module: pass the H2D/D2H color IDs (i16) directly, not @get_color ---
+const memcpy_mod = @import_module("<memcpy/get_params>", .{
+    .width  = rect_w,
+    .height = rect_h,
+    .MEMCPYH2D_1 = MEMCPY_H2D_ID,
+    .MEMCPYD2H_1 = MEMCPY_D2H_ID,
+});
+
+comptime {
+    @comptime_assert((@as(u16, 1) << tree_h) == cells_per_side);
+    @comptime_assert((@as(u16, 1) << (zp_log + blk_lbw + blk_lbh)) == cells_per_side);
+}
+
+layout {
+    @set_rectangle(rect_w, rect_h);
+
+    // --- Assign per-PE code ---
+    // Every PE gets the SAME parameters except the column and row parities
+    // (lane colors) and memcpy's per-column parameters: the compiler emits one program per
+    // distinct parameter set, and compile time grows with that number, not
+    // with the number of PEs (28/10: 16x16 testbench 23.8 s with per-PE
+    // parameters, 3.5 s with identical ones). The position of a PE (fabric
+    // (fx, fy) -> column (x, y), chunk k, pe_map.PeMap.pe_to_column) is computed
+    // at runtime by pe.csl init_position from its fabric coordinates. All params
+    // in one struct literal (no @concat_structs in this CSL).
+    for (@range(u16, rect_h)) |fy| {
+        for (@range(u16, rect_w)) |fx| {
+            @set_tile_code(fx, fy, "pe.csl", .{
+                .cells_per_side = cells_per_side,
+                .prob_range = prob_range,
+                .max_bodies_pe = max_bodies_pe,
+                .tree_h = tree_h,
+                .order_p = order_p,
+                .m2m_n_entries = m2m_n_entries,
+                .m2l_n_entries = m2l_n_entries,
+                .l2l_n_entries = l2l_n_entries,
+                .mp_ent_cap = mp_ent_cap,
+                .parity = fx & 1,
+                .parity_y = fy & 1,
+                .blk_lbw = blk_lbw,
+                .blk_lbh = blk_lbh,
+                .cell_size = cell_size,
+                .zp_log = zp_log,
+                .memcpy_params = memcpy_mod.get_params(fx),
+            });
+        }
+    }
+
+    // --- Exported entry points (host calls them in sequence; see pe.csl) ---
+    // run_p2m, then run_pass once per pass (3H - 4 passes, the last is P2P),
+    // then run_l2p.
+    @export_name("run_p2m", fn()void);
+    @export_name("run_pass", fn()void);
+    @export_name("run_l2p", fn()void);
+
+    @export_name("ptr_fmm_done", [*]u32, true);
+
+    @export_name("ptr_bodies_col", [*]u32, true);
+    @export_name("ptr_forces_col", [*]f32, true);
+
+    // NOTE: ptr_m_lvl* intermediate-multipole exports removed. They were only
+    // used for P2M/M2M host verification and are not read by the runner; keeping
+    // them pinned symbols and pointer globals that pressured .data.hi / the
+    // symbol table. The buffers remain as plain `var` in pe.csl.
+
+    @export_name("ptr_m2m_offsets", [*]u16, true);
+    @export_name("ptr_m2m_child_indices", [*]u16, true);
+    @export_name("ptr_m2m_v_indices", [*]u16, true);
+    @export_name("ptr_m2m_signs", [*]u32, true);
+
+    @export_name("ptr_m2l_offsets", [*]u16, true);
+    @export_name("ptr_m2l_source_indices", [*]u16, true);
+    @export_name("ptr_m2l_v_indices", [*]u16, true);
+    @export_name("ptr_m2l_signs", [*]u32, true);
+
+    @export_name("ptr_l2l_offsets", [*]u16, true);
+    @export_name("ptr_l2l_source_indices", [*]u16, true);
+    @export_name("ptr_l2l_v_indices", [*]u16, true);
+    @export_name("ptr_l2l_signs", [*]u32, true);
+
+    // Per-pass diagnostics and the leaf local expansions for verification.
+    @export_name("ptr_pass_stats", [*]u32, true);
+    @export_name("ptr_pass_stats_all", [*]u32, true);
+    @export_name("ptr_l_leaf", [*]f32, true);
+
+    // Per-PE cycle counter log (see CYCLE COUNTER in pe.csl).
+    @export_name("ptr_tsc_log", [*]u32, true);
+
+    // Transport tables (host-built in zmp_tables.py).
+    @export_name("ptr_mp_hdr", [*]u16, true);
+    @export_name("ptr_mp_ent", [*]u16, true);
+}

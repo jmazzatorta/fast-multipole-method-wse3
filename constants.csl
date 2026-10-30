@@ -1,0 +1,143 @@
+// constants.csl - 2.5D FMM constants
+//
+// Split into two clearly separated blocks:
+//
+//   [A] ALGEBRAIC / GEOMETRIC constants. Foundational, geometry-independent or
+//       derived from the table generator. Fixed now. These are reused from the
+//       3D implementation or recomputed; none depend on the communication
+//       design.
+//
+//   [B] COMMUNICATION constants (header layout, message sizes, lane task
+//       ids). These depend on the transport design.
+
+
+// ===========================================================================
+// IMPORTED PARAMETERS (from layout)
+// ===========================================================================
+param cells_per_side : u16;   // C: domain side in leaf cells (cells per plane side)
+param prob_range : f32;       // physical edge length of the cubic domain
+param max_bodies_pe : u16;    // max bodies in one leaf cell's body buffer
+param cell_size : f32;        // leaf-cell edge = prob_range / C
+param tree_h : u16;           // H = log2(C): levels above the leaves
+param order_p : u16;          // P: expansion order
+param zp_log : u16;           // log2(ZP): ZP = leaf cells per PE along z (ZP = C: one PE per column)
+// Operator table sizes for order P, from the generator (fmm_tables.py
+// table_sizes(), passed by appliance_compile.py). Do NOT hand-edit.
+param m2m_n_entries : u16;
+param m2l_n_entries : u16;
+param l2l_n_entries : u16;
+
+
+// ===========================================================================
+// [A] ALGEBRAIC / GEOMETRIC CONSTANTS  (from the compile parameters)
+// ===========================================================================
+
+// --- Tree geometry ---
+// C == 2**TREE_H (C = 16: TREE_H = 4). Levels 0 (root) .. TREE_H (leaf).
+const TREE_H : u16 = tree_h;
+
+// Box edge length at `level` (0 = root = prob_range, TREE_H = leaf cell):
+// prob_range halved `level` times (exact in f32).
+fn box_size_at_level(level: u16) f32 {
+    var b : f32 = prob_range;
+    var l : u16 = 0;
+    while (l < level) {
+        b = b * 0.5;
+        l += 1;
+    }
+    return b;
+}
+
+// --- Z split (pe_map.py) ---
+// The column of C leaf cells is cut into NK = C / ZP chunks of ZP cells, one
+// per PE. A level-l box is 2**(H-l) cells tall: if that is <= ZP a PE holds
+// ZP / 2**(H-l) consecutive boxes of the level, otherwise one slot (its own box
+// if the PE holds the lowest cell of the box, else a staging slot).
+const LZP : u16 = zp_log;
+const ZP : u16 = @as(u16, 1) << zp_log;
+// Nodes of levels 2..H-1 per PE: sum over sh = H-l = 1..H-2 of
+// 2**(LZP-sh) (sh <= LZP) or 1 (sh > LZP). C - 4 when ZP = C.
+const ZA : u16 = if (LZP < TREE_H - 2) LZP else TREE_H - 2;
+const N_COARSE : u16 = (ZP - (@as(u16, 1) << (LZP - ZA))) + (TREE_H - 2 - ZA);
+
+// --- Multipole / expansion constants ---
+const P : u16 = order_p;
+const N_COEFFS : u16 = (P + 1) * (P + 2) / 2;          // 15 at P=4
+const C_BUF_SIZE : u16 = N_COEFFS * 2;                 // 30 at P=4 (interleaved re/im)
+const N_COEFFS_V : u16 = (2*P + 1) * (2*P + 2) / 2;    // 45 at P=4
+const C_BUF_M2L_SIZE : u16 = N_COEFFS_V * 2;           // 90 at P=4
+
+// --- Operator table sizes (P=4: M2M 92, M2L 375, L2L 105) ---
+const M2M_N_ENTRIES : u16 = m2m_n_entries;
+const M2L_N_ENTRIES : u16 = m2l_n_entries;
+const L2L_N_ENTRIES : u16 = l2l_n_entries;
+
+// Number of CSR-style buckets in the operator tables: one per target coeff,
+// plus the trailing offset. offsets[-1] == N_ENTRIES for each table.
+const N_BUCKETS : u16 = N_COEFFS + 1;                  // 16 at P=4
+
+// (Body layout: see COLUMN BODIES in pe.csl.)
+
+
+// ===========================================================================
+// [B] COMMUNICATION CONSTANTS  (all-static transport: xport.csl + lane.csl)
+// ===========================================================================
+//
+// See the MESSAGE HEADER and TRANSPORT sections of pe.csl.
+
+// --- Message types (2 bits, informational: the receiver knows its pass) ---
+const MSG_M2M : u16 = 0;
+const MSG_M2L : u16 = 1;
+const MSG_L2L : u16 = 2;
+const MSG_P2P : u16 = 3;
+
+// --- Message granularity: K boxes per message ---------------------------
+// A message carries K boxes (consecutive z) of one source column. Levels with
+// more than K boxes along Z split into ceil(nz/K) messages:
+//   K=4, C=16: leaf (nz=16): 4 messages  level3 (nz=8): 2  level2 (nz=4): 1
+// MSG_SIZE = 4*C_BUF_SIZE+1 (121 at P=4). zcount fits in 3 bits.
+const K_CUBES : u16 = 4;
+
+// --- Header layout (32 bits, our header: first word after the hw header) --
+//   bits 31..24 : src_x (8)        -> PE that originated the message
+//   bits 23..16 : src_y (8)
+//   bits 15..14 : msg_type (2)
+//   bits 13..11 : level - 2 (3)    -> data level in [2, 7] (C <= 128)
+//   bits 10..8  : zcount (3)       -> boxes in this message (1..7)
+//   bits  7..0  : z_base (8)       -> first box z index in this message
+const SHIFT_SRC_X   : u16 = 24;
+const SHIFT_SRC_Y   : u16 = 16;
+const SHIFT_MSG_TYPE: u16 = 14;
+const SHIFT_LEVEL   : u16 = 11;
+const SHIFT_ZCOUNT  : u16 = 8;
+const SHIFT_ZBASE   : u16 = 0;
+
+const MASK_8BIT : u32 = 0xFF;
+const MASK_3BIT : u32 = 0x7;
+const MASK_2BIT : u32 = 0x3;
+
+// --- Message sizes ------------------------------------------------------
+const MSG_PAYLOAD_MAX : u16 = K_CUBES * C_BUF_SIZE;    // 120 floats at P=4
+const MSG_SIZE : u16 = MSG_PAYLOAD_MAX + 1;            // our header + payload
+
+// --- Transport (all-static, xport.csl + lane.csl) -----------------------
+// xport.csl owns the colors (3..10), queues (in 2..5, out 2..5) and
+// microthreads (2..7) of the four lanes; memcpy keeps queues and microthreads
+// 0 / 1 and local tasks 16..21. The lane tasks are given here (local task ids
+// must be in [8, 31)): rx / tx of lanes E, W, N, S.
+const lane_e_rx_id : local_task_id = @get_local_task_id(8);
+const lane_e_tx_id : local_task_id = @get_local_task_id(9);
+const lane_w_rx_id : local_task_id = @get_local_task_id(10);
+const lane_w_tx_id : local_task_id = @get_local_task_id(11);
+const lane_n_rx_id : local_task_id = @get_local_task_id(12);
+const lane_n_tx_id : local_task_id = @get_local_task_id(13);
+const lane_s_rx_id : local_task_id = @get_local_task_id(14);
+const lane_s_tx_id : local_task_id = @get_local_task_id(15);
+
+
+comptime {
+    @comptime_assert((@as(u16, 1) << TREE_H) == cells_per_side);
+    // C <= 128: one mp_ent word packs zbase | zcount << 8 with zcount up to C
+    @comptime_assert(TREE_H >= 3 and TREE_H <= 7);
+    @comptime_assert(LZP <= TREE_H);
+}

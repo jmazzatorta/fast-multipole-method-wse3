@@ -1,0 +1,9 @@
+scrap/
+# build / run outputs (see appliance_compile.py, appliance_run.py)
+compiled/
+extracted/
+runs/
+staging/
+backup/
+*.log
+__pycache__/

@@ -1,0 +1,331 @@
+// xport.csl - all-static transport:
+// four static neighbour lanes (lane.csl) E, W, N, S, store-and-forward routing
+// in the cores (X first, then Y), K = 1 credit per direction, two send engines
+// on shared microthreads. No hardware message passing.
+//
+// Resources (memcpy keeps queues and microthreads 0 / 1):
+//   lane  colors  in queue / rx ut  out queue  tx ut (engine)
+//   E     3 / 4   2 / 2             2          6 (A)
+//   W     5 / 6   3 / 3             4          7 (B)
+//   N     7 / 8   4 / 4             3          6 (A)
+//   S     9 / 10  5 / 5             5          7 (B)
+// Four receive microthreads always armed (header area, lane.csl) + two send
+// microthreads shared by two output queues each (WSE-3).
+//
+// Flow control: port d of a PE = its lane-d input (messages travelling d), one
+// data slot. A PE sends a hop in direction d only with a credit for the
+// neighbour's port d (K = 1 initially); the neighbour returns it (a len-0
+// message on the opposite lane) when the slot is freed: relay or turn sent, or
+// final message released by the importer. An engine starts a send only when it
+// holds the credit, so a send never waits on a neighbour; credits use the
+// header area, so they always get in. Waits point along the direction of travel
+// (E/W, then N/S): no cycle (model tools/model/lane_variants.py enws_cr).
+//
+// Importer contract:
+//   xp_init(x, y) on every PE before the first send (host barrier), then
+//   xp_start(nE, nW, nN, nS): messages (data + credits) expected per port.
+//   rx task of lane d: ev = xp_rx_step(d): 0 stage, 1 credit, 2 relay queued,
+//     3 final message in xp_slot(d): consume it, then xp_release(d).
+//   tx task of lane d: ev = xp_tx_step(d): 0 stage, 1 credit sent, 2 relay /
+//     turn sent, 3 the importer's message sent.
+//   Engine e (0 = E+N, 1 = W+S): if !xp_pump(e), the importer may xp_send(d, ...)
+//   for a direction d of engine e with xp_can_send(d). Call the send routine of
+//   both engines after every rx / tx event and after xp_release().
+
+param px : u16;                 // column parity (pe_x % 2)
+param py : u16;                 // row parity (pe_y % 2)
+param max_len : u16;            // payload words after h0, h1
+param e_rx_id : local_task_id;
+param e_tx_id : local_task_id;
+param w_rx_id : local_task_id;
+param w_tx_id : local_task_id;
+param n_rx_id : local_task_id;
+param n_tx_id : local_task_id;
+param s_rx_id : local_task_id;
+param s_tx_id : local_task_id;
+
+const lane_e = @import_module("lane.csl", .{
+    .dir = 0, .parity = px, .color_even = @get_color(3), .color_odd = @get_color(4),
+    .iq_id = 2, .oq_id = 2, .rx_ut_id = 2, .tx_ut_id = 6, .max_len = max_len,
+    .rx_task_id = e_rx_id, .tx_task_id = e_tx_id,
+});
+const lane_w = @import_module("lane.csl", .{
+    .dir = 1, .parity = px, .color_even = @get_color(5), .color_odd = @get_color(6),
+    .iq_id = 3, .oq_id = 4, .rx_ut_id = 3, .tx_ut_id = 7, .max_len = max_len,
+    .rx_task_id = w_rx_id, .tx_task_id = w_tx_id,
+});
+const lane_n = @import_module("lane.csl", .{
+    .dir = 2, .parity = py, .color_even = @get_color(7), .color_odd = @get_color(8),
+    .iq_id = 4, .oq_id = 3, .rx_ut_id = 4, .tx_ut_id = 6, .max_len = max_len,
+    .rx_task_id = n_rx_id, .tx_task_id = n_tx_id,
+});
+const lane_s = @import_module("lane.csl", .{
+    .dir = 3, .parity = py, .color_even = @get_color(9), .color_odd = @get_color(10),
+    .iq_id = 5, .oq_id = 5, .rx_ut_id = 5, .tx_ut_id = 7, .max_len = max_len,
+    .rx_task_id = s_rx_id, .tx_task_id = s_tx_id,
+});
+
+const DIR_E : u16 = 0;
+const DIR_W : u16 = 1;
+const DIR_N : u16 = 2;
+const DIR_S : u16 = 3;
+const FINAL : u16 = 4;
+const K : u16 = 1;
+
+fn opp(d: u16) u16 { return d ^ 1; }          // E <-> W, N <-> S
+fn eng_of(d: u16) u16 { return d & 1; }       // E, N -> engine 0; W, S -> engine 1
+
+var my_x : u16 = 0;
+var my_y : u16 = 0;
+// Port d slot: 0 free, 2 relay waiting for a credit, 3 final (importer), 4 in flight.
+var st = @zeros([4]u16);
+var nxt = @zeros([4]u16);       // next direction of the message held in port d
+var cred = @zeros([4]u16);      // credits for the neighbour's port d
+var owe = @zeros([4]u16);       // credits to send in direction d
+var eng_kind = @zeros([2]u16);  // 0 idle, 1 credit, 2 relay / turn, 3 importer
+var eng_dir = @zeros([2]u16);   // lane of the send in flight
+var eng_slot = @zeros([2]u16);  // port whose message is relayed
+var eng_rr = @zeros([2]u16);    // first port tried at the next relay scan
+var n_fwd : u16 = 0;
+var n_turn : u16 = 0;
+var n_ctx : u16 = 0;
+var n_crx : u16 = 0;
+var n_err : u16 = 0;            // route against the arrival direction, precondition broken
+
+// --- Lane dispatch ------------------------------------------------------------
+fn lane_rx(d: u16) u16 {
+    if (d == DIR_E) return lane_e.lane_rx_step();
+    if (d == DIR_W) return lane_w.lane_rx_step();
+    if (d == DIR_N) return lane_n.lane_rx_step();
+    return lane_s.lane_rx_step();
+}
+
+fn lane_tx(d: u16) bool {
+    if (d == DIR_E) return lane_e.lane_tx_step();
+    if (d == DIR_W) return lane_w.lane_tx_step();
+    if (d == DIR_N) return lane_n.lane_tx_step();
+    return lane_s.lane_tx_step();
+}
+
+fn xp_slot(d: u16) [*]u32 {
+    if (d == DIR_E) return lane_e.lane_slot();
+    if (d == DIR_W) return lane_w.lane_slot();
+    if (d == DIR_N) return lane_n.lane_slot();
+    return lane_s.lane_slot();
+}
+
+fn send_credit(d: u16) void {
+    if (d == DIR_E) {
+        lane_e.lane_credit();
+    } else if (d == DIR_W) {
+        lane_w.lane_credit();
+    } else if (d == DIR_N) {
+        lane_n.lane_credit();
+    } else {
+        lane_s.lane_credit();
+    }
+}
+
+fn forward(d: u16, buf: [*]u32, n: u16) void {
+    if (d == DIR_E) {
+        lane_e.lane_forward(buf, n);
+    } else if (d == DIR_W) {
+        lane_w.lane_forward(buf, n);
+    } else if (d == DIR_N) {
+        lane_n.lane_forward(buf, n);
+    } else {
+        lane_s.lane_forward(buf, n);
+    }
+}
+
+fn send_own(d: u16, h0: u32, h1: u32, payload: [*]u32) void {
+    if (d == DIR_E) {
+        lane_e.lane_send(h0, h1, payload);
+    } else if (d == DIR_W) {
+        lane_w.lane_send(h0, h1, payload);
+    } else if (d == DIR_N) {
+        lane_n.lane_send(h0, h1, payload);
+    } else {
+        lane_s.lane_send(h0, h1, payload);
+    }
+}
+
+// Next direction of a message for (fx, fy) at this PE: X first, then Y.
+fn route(h1: u32) u16 {
+    const fx : u16 = lane_e.lane_fx(h1);
+    const fy : u16 = lane_e.lane_fy(h1);
+    if (fx > my_x) return DIR_E;
+    if (fx < my_x) return DIR_W;
+    if (fy < my_y) return DIR_N;
+    if (fy > my_y) return DIR_S;
+    return FINAL;
+}
+
+// --- Setup ----------------------------------------------------------------------
+fn xp_init(x: u16, y: u16) void {
+    my_x = x;
+    my_y = y;
+    for (@range(u16, 4)) |d| {
+        st[d] = 0;
+        nxt[d] = 0;
+        cred[d] = K;
+        owe[d] = 0;
+    }
+    for (@range(u16, 2)) |e| {
+        eng_kind[e] = 0;
+        eng_rr[e] = 0;
+    }
+    n_fwd = 0;
+    n_turn = 0;
+    n_ctx = 0;
+    n_crx = 0;
+    n_err = 0;
+}
+
+fn xp_start(n_e: u16, n_w: u16, n_n: u16, n_s: u16) void {
+    lane_e.lane_start(n_e);
+    lane_w.lane_start(n_w);
+    lane_n.lane_start(n_n);
+    lane_s.lane_start(n_s);
+}
+
+// --- Receive --------------------------------------------------------------------
+// Call from the rx task of lane d (see the contract at the top).
+fn xp_rx_step(d: u16) u16 {
+    const ev : u16 = lane_rx(d);
+    if (ev == 0) return 0;
+    if (ev == 1) {
+        // A credit travelling d comes from the neighbour behind (direction
+        // opp(d)): it freed its port opp(d), which my opp(d) sends fill.
+        cred[opp(d)] += 1;
+        n_crx += 1;
+        return 1;
+    }
+    const b = xp_slot(d);
+    const nd : u16 = route(b[1]);
+    // X first, then Y: a route never turns back, nor from N / S onto E / W.
+    const bad = nd != FINAL and (nd == opp(d) or (d >= DIR_N and nd < DIR_N));
+    if (nd == FINAL or bad) {
+        if (bad) n_err += 1;                  // deliver here, the counts will show it
+        st[d] = 3;
+        return 3;
+    }
+    st[d] = 2;
+    nxt[d] = nd;
+    return 2;
+}
+
+// The importer has consumed the final message of port d.
+fn xp_release(d: u16) void {
+    st[d] = 0;
+    owe[opp(d)] += 1;
+}
+
+// --- Send -----------------------------------------------------------------------
+fn xp_busy(e: u16) bool { return eng_kind[e] != 0; }
+fn xp_can_send(d: u16) bool { return eng_kind[eng_of(d)] == 0 and cred[d] > 0; }
+
+// Start an owed credit or a relay / turn that holds a credit on engine e.
+// False: nothing to send (or the engine is busy).
+fn xp_pump(e: u16) bool {
+    if (eng_kind[e] != 0) return false;
+    // credits first: directions e (E or W) and e + 2 (N or S)
+    var d : u16 = e;
+    while (d < 4) {
+        if (owe[d] > 0) {
+            owe[d] -= 1;
+            eng_kind[e] = 1;
+            eng_dir[e] = d;
+            send_credit(d);
+            return true;
+        }
+        d += 2;
+    }
+    // relays: ports whose message leaves on a direction of this engine, round robin
+    var i : u16 = 0;
+    while (i < 4) {
+        var p : u16 = eng_rr[e] + i;
+        if (p >= 4) p -= 4;
+        if (st[p] == 2 and eng_of(nxt[p]) == e and cred[nxt[p]] > 0) {
+            const b = xp_slot(p);
+            cred[nxt[p]] -= 1;
+            st[p] = 4;
+            eng_kind[e] = 2;
+            eng_dir[e] = nxt[p];
+            eng_slot[e] = p;
+            eng_rr[e] = if (p == 3) 0 else p + 1;
+            forward(nxt[p], b, 2 + lane_e.lane_len(b[1]));
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// The importer's own message in direction d: h0, h1, then lane_len(h1) payload
+// words read in place (unchanged until xp_tx_step(d) returns 3).
+// Precondition: xp_can_send(d).
+fn xp_send(d: u16, h0: u32, h1: u32, payload: [*]u32) void {
+    const e : u16 = eng_of(d);
+    if (eng_kind[e] != 0 or cred[d] == 0) {
+        n_err += 1;                            // importer broke the precondition
+        return;
+    }
+    cred[d] -= 1;
+    eng_kind[e] = 3;
+    eng_dir[e] = d;
+    send_own(d, h0, h1, payload);
+}
+
+// Call from the tx task of lane d (see the contract at the top).
+fn xp_tx_step(d: u16) u16 {
+    if (!lane_tx(d)) return 0;
+    const e : u16 = eng_of(d);
+    const k : u16 = eng_kind[e];
+    eng_kind[e] = 0;
+    if (k == 1) {
+        n_ctx += 1;
+    } else if (k == 2) {
+        const p : u16 = eng_slot[e];
+        st[p] = 0;
+        owe[opp(p)] += 1;
+        if (eng_dir[e] == p) {
+            n_fwd += 1;
+        } else {
+            n_turn += 1;
+        }
+    }
+    return k;
+}
+
+// Nothing held, owed or in flight.
+fn xp_idle() bool {
+    if (eng_kind[0] != 0 or eng_kind[1] != 0) return false;
+    for (@range(u16, 4)) |d| {
+        if (st[d] != 0 or owe[d] != 0) return false;
+    }
+    return true;
+}
+
+// --- Diagnostics ------------------------------------------------------------------
+fn xp_fwd() u16 { return n_fwd; }
+fn xp_turns() u16 { return n_turn; }
+fn xp_credits_sent() u16 { return n_ctx; }
+fn xp_credits_received() u16 { return n_crx; }
+fn xp_errors() u16 { return n_err; }
+fn xp_lane_rx_errors() u16 {
+    return lane_e.lane_rx_errors() + lane_w.lane_rx_errors() + lane_n.lane_rx_errors()
+           + lane_s.lane_rx_errors();
+}
+fn xp_lane_tx_errors() u16 {
+    return lane_e.lane_tx_errors() + lane_w.lane_tx_errors() + lane_n.lane_tx_errors()
+           + lane_s.lane_tx_errors();
+}
+fn xp_h1(fx: u16, fy: u16, len: u16) u32 { return lane_e.lane_h1(fx, fy, len); }
+fn xp_fx(h1: u32) u16 { return lane_e.lane_fx(h1); }
+fn xp_fy(h1: u32) u16 { return lane_e.lane_fy(h1); }
+fn xp_len(h1: u32) u16 { return lane_e.lane_len(h1); }
+
+comptime {
+    @comptime_assert(px < 2 and py < 2);
+}

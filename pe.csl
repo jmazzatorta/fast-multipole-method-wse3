@@ -1,0 +1,1208 @@
+// pe.csl - 2.5D FMM, PER-PE PROGRAM
+//
+// Mapping (2.5D with z split): the plane column (pe_x, pe_y) of C leaf cells
+// along Z is cut into NK = C / ZP chunks; this PE is chunk pe_k and holds the
+// leaf cells z = pe_k * ZP .. pe_k * ZP + ZP - 1 (local index z - z0). The NK
+// PEs of a column form a block on the fabric (pe_map.py; the layout computes
+// pe_x, pe_y, pe_k). ZP = C (NK = 1) is one PE per column. A leaf cell is the
+// 1x1x1 cube (pe_x, pe_y, z); multipoles are fully 3D, one per cube.
+//
+// Parametric in C = 2**H (TREE_H, levels 0 = root .. H = leaf), in the
+// expansion order P and in ZP (compile parameters, see constants.csl).
+//
+// Resident state (persistent for the whole algorithm), per level l = 2..H: a
+// level-l box is e = 2**(H-l) cells tall. If e <= ZP this PE holds the ZP / e
+// boxes of its z range (level_zbase .. + level_nodes); if e > ZP it has ONE
+// slot, for the box containing its lowest cell: its own box when it holds that
+// box's lowest cell (level_held), otherwise a staging slot (the partial of the
+// box in M2M, a copy of it in L2L). The leaf level (ZP nodes) is m_leaf /
+// l_leaf; levels 2..H-1 are packed in m_coarse / l_coarse (N_COARSE nodes).
+// Levels 1 and 0 are not stored: FMM has no M2L interactions there (M2L runs at
+// levels 2..H and L2L starts at level 2), so their expansions are never used.
+//
+// COMMUNICATION: all-static transport, four neighbour lanes with store-and-
+// forward in the cores and credits (xport.csl, lane.csl, TRANSPORT below; no
+// hardware message passing). Every exchange of
+// the algorithm is a pass (see PASSES): M2M c->c-1, M2L at every level H..2,
+// L2L p->p+1 and the P2P near field. A sender sends its data to each PE that
+// needs it (host tables, zmp_tables.py); PEs on the way forward it. Pairs of
+// boxes held by the same PE are local work.
+//
+// NOTE: the <simprint> debug-print module is not used (its inline byte loop
+// forced --max-inlined-iterations up and cost .data.hi/.text).
+
+// memcpy params struct from the layout. Declared untyped: the `comptime_struct`
+// type annotation is not accepted by the current cslc (server 1.20.2).
+param memcpy_params;
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// --- GLOBAL PARAMETERS (from layout) ---
+param cells_per_side : u16;   // C
+param prob_range : f32;
+param max_bodies_pe : u16;    // max bodies per leaf cell
+param cell_size : f32;
+param tree_h : u16;           // H = log2(C)
+param order_p : u16;          // expansion order P
+param m2m_n_entries : u16;    // operator table sizes for order P (fmm_tables)
+param m2l_n_entries : u16;
+param l2l_n_entries : u16;
+
+// --- TOPOLOGY PARAMETERS (from layout, identical on every PE) ---
+// The position of this PE (fabric (fab_x, fab_y) in the rectangle, plane
+// column (pe_x, pe_y), chunk pe_k; pe_map.py) is computed at runtime by
+// init_position from its fabric coordinates: identical parameters let the
+// compiler share one program between PEs (see layout.csl).
+param zp_log : u16;           // log2(ZP)
+param blk_lbw : u16;          // log2 of the block width / height (pe_map.py)
+param blk_lbh : u16;
+
+// --- TRANSPORT PARAMETERS (from layout) ---
+// mp_ent_cap: entries of the per-PE send table mp_ent (zmp_tables.py).
+// parity, parity_y: column / row parity of this PE (lane colors; the only
+// per-PE parameters).
+param mp_ent_cap : u16;
+param parity : u16;
+param parity_y : u16;
+
+// --- MODULES ---
+const cons = @import_module("constants.csl", .{
+    .cells_per_side = cells_per_side,
+    .prob_range = prob_range,
+    .max_bodies_pe = max_bodies_pe,
+    .cell_size = cell_size,
+    .tree_h = tree_h,
+    .order_p = order_p,
+    .zp_log = zp_log,
+    .m2m_n_entries = m2m_n_entries,
+    .m2l_n_entries = m2l_n_entries,
+    .l2l_n_entries = l2l_n_entries,
+});
+const geom = @import_module("geometry.csl", .{
+    .prob_range = prob_range,
+    .cells_per_side = cells_per_side,
+    .TREE_H = cons.TREE_H,
+});
+const kernels = @import_module("kernels.csl", .{
+    .P = cons.P,
+    .M2M_N_ENTRIES = cons.M2M_N_ENTRIES,
+    .M2L_N_ENTRIES = cons.M2L_N_ENTRIES,
+    .L2L_N_ENTRIES = cons.L2L_N_ENTRIES,
+    .N_BUCKETS = cons.N_BUCKETS,
+});
+const time_mod = @import_module("<time>");
+const tc = @import_module("<tile_config>");
+const xp = @import_module("xport.csl", .{
+    .px = parity, .py = parity_y, .max_len = cons.MSG_PAYLOAD_MAX,
+    .e_rx_id = cons.lane_e_rx_id, .e_tx_id = cons.lane_e_tx_id,
+    .w_rx_id = cons.lane_w_rx_id, .w_tx_id = cons.lane_w_tx_id,
+    .n_rx_id = cons.lane_n_rx_id, .n_tx_id = cons.lane_n_tx_id,
+    .s_rx_id = cons.lane_s_rx_id, .s_tx_id = cons.lane_s_tx_id,
+});
+
+// --- RUNTIME POSITION ---
+// Fixed for the whole run. Set by init_position (called in run_p2m).
+var fab_x : u16 = 0;        // fabric position in the rectangle
+var fab_y : u16 = 0;
+var pe_x : u16 = 0;
+var pe_y : u16 = 0;
+var pe_k : u16 = 0;
+var z0 : u16 = 0;           // first leaf cell of this PE = pe_k * ZP
+var center_x : f32 = 0.0;   // (pe_x + 0.5) * cell_size, fixed for column
+var center_y : f32 = 0.0;   // (pe_y + 0.5) * cell_size, fixed for column
+
+// ===========================================================================
+// OPERATOR TABLES (math block, loaded by host via memcpy; device buffers u32)
+// ===========================================================================
+// Identical to 3D: these are the reused, geometry-independent tables. Signs are
+// 4 bits packed into a u32 (upper 16 bits zero, memcpy requires u32 device
+// buffers). Same per PE (not scaling with C): ~4.46 KB.
+export var m2m_offsets       = @zeros([cons.N_BUCKETS]u16);
+export var m2m_child_indices = @zeros([cons.M2M_N_ENTRIES]u16);
+export var m2m_v_indices     = @zeros([cons.M2M_N_ENTRIES]u16);
+export var m2m_signs         = @zeros([cons.M2M_N_ENTRIES]u32);
+
+export var m2l_offsets        = @zeros([cons.N_BUCKETS]u16);
+export var m2l_source_indices = @zeros([cons.M2L_N_ENTRIES]u16);
+export var m2l_v_indices      = @zeros([cons.M2L_N_ENTRIES]u16);
+export var m2l_signs          = @zeros([cons.M2L_N_ENTRIES]u32);
+
+export var l2l_offsets        = @zeros([cons.N_BUCKETS]u16);
+export var l2l_source_indices = @zeros([cons.L2L_N_ENTRIES]u16);
+export var l2l_v_indices      = @zeros([cons.L2L_N_ENTRIES]u16);
+export var l2l_signs          = @zeros([cons.L2L_N_ENTRIES]u32);
+
+
+// ===========================================================================
+// COLUMN BODIES  (Option 1: fixed per-cell blocks)
+// ===========================================================================
+// Layout: ZP contiguous cell blocks (the PE's leaf cells), each
+//   [ count (1 slot) | body_0 (x,y,z,q) | body_1 | ... | body_{max-1} ]
+// Block stride = 1 + max_bodies_pe*4 (in u32 slots; floats bitcast to u32).
+// Cell z (global) has its block at (z - z0) * CELL_BLOCK.
+// Worst-case memory equals the dense layout, so we take the simple one.
+const CELL_BLOCK : u16 = 1 + max_bodies_pe * 4;
+const BODIES_COL_LEN : u16 = cons.ZP * CELL_BLOCK;
+export var bodies_col = @zeros([BODIES_COL_LEN]u32);
+
+// P2P pass: a message carries P2P_CELLS whole cell blocks (count + bodies), as
+// many as fit in the payload, at most 7 (3-bit zcount). fmm_passes.p2p_cells
+// must give the same number.
+const P2P_CELLS_FIT : u16 = cons.MSG_PAYLOAD_MAX / CELL_BLOCK;
+const P2P_CELLS : u16 = if (P2P_CELLS_FIT > 7) 7 else P2P_CELLS_FIT;
+
+// ===========================================================================
+// RESIDENT STATE  (leaf buffers + packed coarse levels, along Z)
+// ===========================================================================
+// Node n (local index) at level l: m_level_ptr(l)[n * C_BUF_SIZE ..]
+// (C_BUF_SIZE floats); global box z = level_zbase(l) + n. Leaf level H: ZP
+// nodes in m_leaf / l_leaf. Levels 2..H-1: level_nodes(l) nodes each, packed
+// in m_coarse / l_coarse from coarse_offset(l) (cons.N_COARSE nodes in all).
+// m_leaf is the P2M output.
+// Not exported (except l_leaf, for the host check): see layout.csl.
+const N_COARSE : u16 = cons.N_COARSE;
+
+var m_leaf = @zeros([cons.ZP * cons.C_BUF_SIZE]f32);
+var m_coarse = @zeros([N_COARSE * cons.C_BUF_SIZE]f32);
+var l_leaf = @zeros([cons.ZP * cons.C_BUF_SIZE]f32);
+var l_coarse = @zeros([N_COARSE * cons.C_BUF_SIZE]f32);
+
+// ===========================================================================
+// SCRATCH  (fixed, recycled per translation; does NOT grow with C)
+// ===========================================================================
+// contrib_buf: solid harmonics of one body (used by P2M).
+// v_buf / v_buf_m2l: translation-vector harmonics (used by M2M/L2L and M2L).
+var contrib_buf = @zeros([cons.C_BUF_SIZE]f32);
+var v_buf = @zeros([cons.C_BUF_SIZE]f32);
+var v_buf_m2l = @zeros([cons.C_BUF_M2L_SIZE]f32);
+
+// ===========================================================================
+// RESULTS  (per body in the column: fx, fy, fz, pot)
+// ===========================================================================
+// One block of max_bodies_pe*4 per local cell, same per-cell stride idea as
+// bodies.
+export var forces_col = @zeros([cons.ZP * max_bodies_pe * 4]f32);
+export var fmm_done = @zeros([1]u32);
+
+
+
+// ===========================================================================
+// MESSAGE HEADER  (our 32-bit header, first word after the hardware header)
+// ===========================================================================
+// Layout in constants.csl. The receiver decides what to do only from it.
+fn build_header(src_x: u16, src_y: u16, msg_type: u16, level: u16,
+                zcount: u16, zbase: u16) u32 {
+    var h : u32 = (@as(u32, src_x) & cons.MASK_8BIT) << cons.SHIFT_SRC_X;
+    h |= (@as(u32, src_y) & cons.MASK_8BIT) << cons.SHIFT_SRC_Y;
+    h |= (@as(u32, msg_type) & cons.MASK_2BIT) << cons.SHIFT_MSG_TYPE;
+    h |= (@as(u32, level - 2) & cons.MASK_3BIT) << cons.SHIFT_LEVEL;
+    h |= (@as(u32, zcount) & cons.MASK_3BIT) << cons.SHIFT_ZCOUNT;
+    h |= (@as(u32, zbase) & cons.MASK_8BIT) << cons.SHIFT_ZBASE;
+    return h;
+}
+fn hdr_src_x(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_SRC_X) & cons.MASK_8BIT); }
+fn hdr_src_y(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_SRC_Y) & cons.MASK_8BIT); }
+fn hdr_zcount(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_ZCOUNT) & cons.MASK_3BIT); }
+fn hdr_zbase(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_ZBASE) & cons.MASK_8BIT); }
+
+// ===========================================================================
+// M2L MATH
+// ===========================================================================
+//
+// One message carries zcount source-box multipoles (z indices zbase..) of the
+// source column at plane box (sbx, sby); this PE's column is target box
+// (tbx, tby). Both are in BOX units of `level`. For every (source, target) box
+// pair in the FMM interaction list, with the target among the boxes held by
+// this PE, translate the source multipole into the target's local expansion
+// at `level`.
+//
+// INTERACTION LIST (2:1 octree): the two boxes are NOT adjacent
+// (max |d| >= 2) and their PARENTS ARE adjacent (|parent difference| <= 1 on
+// every axis). (The previous guard 2 <= max|d| <= 3 had no parent test and
+// double-counted pairs already covered at the coarser level.)
+// Translation vector: d = (target - source) * box_size_at_level(level).
+fn apply_m2l(level: u16, tbx: u16, tby: u16, sbx: u16, sby: u16,
+             zbase: u16, zcount: u16, payload: [*]f32) void {
+    // Planar parent adjacency, decided once for the whole message.
+    const tpx : i16 = @as(i16, tbx >> 1); const spx : i16 = @as(i16, sbx >> 1);
+    const tpy : i16 = @as(i16, tby >> 1); const spy : i16 = @as(i16, sby >> 1);
+    const dpx : i16 = tpx - spx; const dpy : i16 = tpy - spy;
+    if (dpx < -1 or dpx > 1 or dpy < -1 or dpy > 1) return;
+
+    const dxp : i16 = @as(i16, tbx) - @as(i16, sbx);
+    const dyp : i16 = @as(i16, tby) - @as(i16, sby);
+    const adx : i16 = if (dxp < 0) -dxp else dxp;
+    const ady : i16 = if (dyp < 0) -dyp else dyp;
+    const mxy : i16 = if (adx > ady) adx else ady;
+
+    const tz0 : u16 = level_zbase(level);
+    const ntz : u16 = level_nodes(level);
+    const l_target = l_level_ptr(level);
+    const b_size : f32 = cons.box_size_at_level(level);
+
+    for (@range(u16, zcount)) |ci| {
+        const src_z : u16 = zbase + ci;
+        const src_exp : [*]f32 = @ptrcast([*]f32, &payload[ci * cons.C_BUF_SIZE]);
+        for (@range(u16, ntz)) |tn| {
+            const tz : u16 = tz0 + tn;
+            const dz : i16 = @as(i16, tz) - @as(i16, src_z);
+            const dpz : i16 = @as(i16, tz >> 1) - @as(i16, src_z >> 1);
+            if (dpz < -1 or dpz > 1) continue;            // parents not adjacent
+            const adz : i16 = if (dz < 0) -dz else dz;
+            const mx : i16 = if (adz > mxy) adz else mxy;
+            if (mx < 2) continue;                           // adjacent: near field
+
+            var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
+            geom.get_physical_distances(dxp, dyp, dz, b_size, &dist_x, &dist_y, &dist_z);
+            kernels.compute_irregular_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
+            kernels.translate(
+                @ptrcast([*]f32, &v_buf_m2l[0]),
+                src_exp,
+                @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]),
+                @ptrcast([*]u16, &m2l_offsets[0]),
+                @ptrcast([*]u16, &m2l_source_indices[0]),
+                @ptrcast([*]u16, &m2l_v_indices[0]),
+                @ptrcast([*]u32, &m2l_signs[0]));
+            pass_stats[4] += 1;     // applied translations (diagnostic)
+        }
+    }
+}
+
+
+
+// ===========================================================================
+// PASSES  (transport-independent: state, local work, consume, completion)
+// ===========================================================================
+//
+// PASSES, in order (one host launch of run_pass each), H = TREE_H, NPASS =
+// 3H - 4 (C = 16: M2M43 M2M32 M2L4 M2L3 M2L2 L2L23 L2L34 P2P). Same list as
+// fmm_passes.py on the host; who sends what to whom: zmp_tables.py.
+//   M2M c->c-1, c = H..3 (passes 0 .. H-3): the PEs holding level-c boxes
+//            send their level c-1 partials (from m2m_z_local) to the parent's
+//            owner, which ADDS them; then, if c-1 > 2, the owners of level c-1
+//            boxes do the z-local M2M c-1 -> c-2.
+//   M2L L, L = H..2 (passes H-2 .. 2H-4): the owners of level-L boxes send
+//            their multipoles; an owner applies M2L for every pair of the
+//            interaction list with the target among its boxes (the pairs with
+//            the source on the same PE at begin).
+//   L2L p->p+1, p = 2..H-1 (passes 2H-3 .. 3H-6): the owner of a level-p box
+//            sends its l to every other PE holding one of its children, which
+//            COPIES it; then every PE holding level p+1 boxes does the z-local
+//            L2L p -> p+1.
+//   P2P (pass 3H-5): every PE sends its cell body blocks (P2P_CELLS per
+//            message) to the PEs holding a neighbour cell; a PE sums the direct
+//            interactions of its cells with the cells at |dx|, |dy|, |dz| <= 1;
+//            the part with the source cells on this PE is done at begin.
+// Each message carries zcount boxes (global z indices zbase..) of the source
+// column (P2P: zcount cell blocks). The receiver decides what to do ONLY from
+// the source coordinates in the header (pass_consume).
+//
+// Life of a pass on a PE:
+//   pass_prepare(p)  at the completion of pass p-1 (run_p2m for p = 0), BEFORE
+//                    any message of p can arrive: state reset, transport armed;
+//   pass_begin()     the host launch of p (run_pass): own sends start, then the
+//                    column-local work;
+//   pass_consume()   every received message;
+//   pass_complete()  when the transport has received and sent everything:
+//                    z-local completion action, stats saved, pass p+1 prepared,
+//                    step id written to fmm_done.
+
+const NPASS : u16 = 3 * cons.TREE_H - 4;
+const PASS_M2L_FIRST : u16 = cons.TREE_H - 2;      // M2L at the leaf level
+const PASS_L2L_FIRST : u16 = 2 * cons.TREE_H - 3;  // L2L 2 -> 3
+const PASS_P2P : u16 = 3 * cons.TREE_H - 5;
+// Pass kinds = the message types of the header (constants.csl).
+const KIND_M2M : u16 = cons.MSG_M2M;
+const KIND_M2L : u16 = cons.MSG_M2L;
+const KIND_L2L : u16 = cons.MSG_L2L;
+const KIND_P2P : u16 = cons.MSG_P2P;
+
+// pass_stats (reset when a pass is prepared):
+//   [0] messages consumed [1] relays done (straight forwards + turns)
+//   [2] own messages sent [3] port arrivals (data + credits, E + W + N + S)
+//   [4] work items (M2L translations / boxes added or copied / P2P
+//       (target cell, source cell) pairs) [5] stray rx
+//   [6] pass done flag [7] protocol errors
+var pass_stats = @zeros([8]u32);
+// Per-pass copy of pass_stats, written when the pass completes (pass_stats
+// itself is reset by the preparation of the next pass before the host could
+// read it). The host reads this once, at the end of the run.
+var pass_stats_all = @zeros([NPASS * 8]u32);
+
+var pass_active : u16 = 0;      // 1 while a pass is prepared or running
+var pass_started : u16 = 0;     // 1 once this PE launched the pass (own sends)
+var pass_done : u16 = 0;        // one-shot completion latch of the pass
+var cur_pass : u16 = 0;
+var cur_kind : u16 = 0;         // KIND_* of the current pass
+var pass_dlevel : u16 = 0;      // level of the data the pass sends
+
+fn pass_kind(pass: u16) u16 {
+    if (pass < PASS_M2L_FIRST) return KIND_M2M;
+    if (pass < PASS_L2L_FIRST) return KIND_M2L;
+    if (pass < PASS_P2P) return KIND_L2L;
+    return KIND_P2P;
+}
+
+// Level of the data each pass sends: M2M c->c-1: c-1; M2L L: L; L2L p->p+1:
+// p; P2P: the leaf level (cell bodies). (Every term stays >= 0 in u16.)
+fn pass_data_level(pass: u16) u16 {
+    const k = pass_kind(pass);
+    if (k == KIND_M2M) return (cons.TREE_H - 1) - pass;
+    if (k == KIND_M2L) return (2 * cons.TREE_H - 2) - pass;
+    if (k == KIND_L2L) return (pass + 5) - 2 * cons.TREE_H;
+    return cons.TREE_H;
+}
+
+fn pass_data_ptr(pass: u16) [*]f32 {
+    const lv = pass_data_level(pass);
+    if (pass_kind(pass) == KIND_L2L) {
+        const l = l_level_ptr(lv);
+        return @ptrcast([*]f32, &l.*[0]);
+    }
+    const m = m_level_ptr(lv);
+    return @ptrcast([*]f32, &m.*[0]);
+}
+
+// Plain add (M2M) or copy (L2L) of a message's boxes into a level buffer,
+// from local node `nbase`.
+fn store_boxes(dst: [*]f32, nbase: u16, zcount: u16, payload: [*]f32, add: bool) void {
+    for (@range(u16, zcount)) |ci| {
+        const db : u16 = (nbase + ci) * cons.C_BUF_SIZE;
+        const sb : u16 = ci * cons.C_BUF_SIZE;
+        for (@range(u16, cons.C_BUF_SIZE)) |i| {
+            if (add) { dst[db + i] += payload[sb + i]; } else { dst[db + i] = payload[sb + i]; }
+        }
+        pass_stats[4] += 1;
+    }
+}
+
+// Consume one message of the current pass (header already read).
+fn pass_consume(header: u32, payload: [*]f32) void {
+    const sx = hdr_src_x(header);
+    const sy = hdr_src_y(header);
+    const zb = hdr_zbase(header);
+    const zc = hdr_zcount(header);
+    const lv = pass_dlevel;
+    const sh : u16 = cons.TREE_H - lv;          // log2 of the level-lv box side in columns
+    if (cur_kind == KIND_M2M) {
+        // the owner of the level-lv (= c-1) boxes adds the partials of its
+        // own plane block
+        if (geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv)
+            and (sx >> sh) == (pe_x >> sh) and (sy >> sh) == (pe_y >> sh)) {
+            const m = m_level_ptr(lv);
+            store_boxes(@ptrcast([*]f32, &m.*[0]), zb - level_zbase(lv), zc, payload, true);
+        }
+    } else if (cur_kind == KIND_M2L) {
+        if (geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv)) {
+            apply_m2l(lv, pe_x >> sh, pe_y >> sh, sx >> sh, sy >> sh, zb, zc, payload);
+        }
+    } else if (cur_kind == KIND_L2L) {
+        // a PE holding level lv+1 boxes copies the l of level lv of the rep(lv)
+        // column of its block (its own box or a staging slot)
+        if (geom.pe_is_plane_node(pe_x, pe_y, lv + 1) and level_held(lv + 1)
+            and sx == ((pe_x >> sh) << sh) and sy == ((pe_y >> sh) << sh)) {
+            const l = l_level_ptr(lv);
+            store_boxes(@ptrcast([*]f32, &l.*[0]), zb - level_zbase(lv), zc, payload, false);
+        }
+    } else {
+        // P2P: own and plane-neighbour columns (the own column only from other
+        // chunks: a PE does not receive its own messages)
+        const adx : u16 = if (sx > pe_x) sx - pe_x else pe_x - sx;
+        const ady : u16 = if (sy > pe_y) sy - pe_y else pe_y - sy;
+        if (adx <= 1 and ady <= 1) {
+            const pw = @ptrcast([*]u32, payload);
+            for (@range(u16, zc)) |ci| {
+                p2p_from_cell(zb + ci, @ptrcast([*]u32, &pw[ci * CELL_BLOCK]));
+            }
+        }
+    }
+}
+
+// Prepare pass `pass`: reset the pass state, then arm the transport. Called
+// BEFORE any message of the pass can arrive (end of the previous step).
+fn pass_prepare(pass: u16) void {
+    cur_pass = pass;
+    cur_kind = pass_kind(pass);
+    pass_dlevel = pass_data_level(pass);
+    for (@range(u16, 8)) |k| { pass_stats[k] = 0; }
+    pass_done = 0;
+    pass_started = 0;
+    pass_active = 1;
+    transport_prepare(pass);
+}
+
+// Local work of the pass (no message): M2L pairs with source and target on
+// this PE, and the P2P with the source cells on this PE.
+fn pass_local_work() void {
+    if (cur_kind == KIND_M2L) {
+        const lv = pass_dlevel;
+        if (geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv)) {
+            const sh : u16 = cons.TREE_H - lv;
+            const nn : u16 = level_nodes(lv);
+            const zb0 : u16 = level_zbase(lv);
+            const m = pass_data_ptr(cur_pass);
+            var n : u16 = 0;
+            while (n < nn) {
+                var zc : u16 = nn - n;
+                if (zc > cons.K_CUBES) zc = cons.K_CUBES;
+                apply_m2l(lv, pe_x >> sh, pe_y >> sh, pe_x >> sh, pe_y >> sh,
+                          zb0 + n, zc, @ptrcast([*]f32, &m[n * cons.C_BUF_SIZE]));
+                n += zc;
+            }
+        }
+    }
+    if (cur_kind == KIND_P2P) p2p_column_local();
+}
+
+// Launch the prepared pass on this PE (host launch): own sends first, then the
+// column-local part, then the completion check.
+fn pass_begin() void {
+    if (pass_active == 0) { pass_stats[7] += 1; return; }    // nothing prepared
+    pass_started = 1;
+    transport_start();
+    pass_local_work();
+    transport_check_done();
+}
+
+// Called by the transport once, when this PE has received and sent everything
+// of the current pass.
+fn pass_complete() void {
+    pass_done = 1;
+    pass_stats[6] = 1;
+    for (@range(u16, 8)) |i| { pass_stats_all[cur_pass * 8 + i] = pass_stats[i]; }
+    // Completion action of the pass (local, all its messages are in).
+    const p = cur_pass;
+    const lv = pass_dlevel;
+    if (cur_kind == KIND_M2M) {
+        // level-lv boxes complete at their owners: z-local lv -> lv-1
+        // partials, down to level 2 (the last M2M pass, lv = 2, has no action)
+        if (lv > 2 and geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv)) m2m_z_local(lv);
+    } else if (cur_kind == KIND_L2L) {
+        // the level-lv parents are now on every PE holding level lv+1 boxes:
+        // z-local lv -> lv+1
+        if (geom.pe_is_plane_node(pe_x, pe_y, lv + 1) and level_held(lv + 1)) l2l_z_local(lv);
+    }
+    if (p + 1 < NPASS) {
+        pass_prepare(p + 1);
+    } else {
+        pass_active = 0;
+    }
+    phase_signal_done(STEP_PASS0 + @as(u32, p));
+}
+
+
+// ===========================================================================
+// TRANSPORT  (all-static: xport.csl + lane.csl)
+// ===========================================================================
+//
+// Hardware message passing merges messages on some links of every CS-3,
+// horizontal and vertical, also one-row hops crossing head-on (measured
+// on the CS-3 systems at ALCF); static neighbour routes do not. So every hop moves ONE
+// PE on a static lane: a message to (dest_x, dest_y) (fabric coordinates of the
+// rectangle) travels along X first, then Y, and every PE in between forwards
+// it (xport.csl, store-and-forward); a hop needs a credit (one slot per
+// direction at the next PE). Wire format: [our header][h1 = xp_h1(dest_x,
+// dest_y, len)][payload]; the payload is never empty (len 0 is a credit).
+//
+// Host tables (zmp_tables.py), pass p: mp_hdr[p * HDR_F + 0..9] =
+//   n_rx                messages this PE consumes
+//   arr E, W, N, S      messages (data + credits) arriving on each port
+//   off                 first entry of the pass in mp_ent
+//   n_e, n_w, n_n, n_s  own entries whose first hop is E, W, N, S (stored in
+//                       this order from off; each group in table order)
+// mp_ent[e * 3 + 0..2] = dest_x, dest_y, zbase | zcount << 8 (global z). An
+// entry is split into messages of at most K_CUBES boxes (P2P: P2P_CELLS
+// cells); the payload is read IN PLACE from the pass data (no copy).
+// Two send engines (E+N, W+S), one message in flight each: owed credits, then
+// relays, then own messages, each only with a credit. A final message is
+// consumed in the rx task, then its slot is released (credit back).
+// Deadlock-free without any barrier but the per-pass host launch: waits point
+// along the direction of travel, and an engine starts a send only when it
+// holds the credit (checked by an event-level model and a transport testbench). When a pass
+// completes on a PE every credit it lent is back (the arrivals it waits for
+// include them): the transport is idle for the next pass.
+
+const HDR_F : u16 = 10;
+export var mp_hdr = @zeros([NPASS * HDR_F]u16);
+export var mp_ent = @zeros([mp_ent_cap * 3]u16);
+
+var tr_n_rx : u16 = 0;          // messages to consume in the pass
+var tr_rx : u16 = 0;            // consumed
+var tr_arr = @zeros([4]u16);    // port arrivals expected (data + credits), E W N S
+var tr_got = @zeros([4]u16);
+
+// Own sends per first hop o (0 E, 1 W, 2 N, 3 S): first entry, number of
+// entries, next entry, boxes of it already sent.
+var out_e0 = @zeros([4]u16);
+var out_ne = @zeros([4]u16);
+var out_e = @zeros([4]u16);
+var out_zoff = @zeros([4]u16);
+var eng_first = @zeros([2]u16); // direction tried first by each engine (alternates)
+// Error counters of the transport at the start of the pass (deltas -> stats[7]).
+var err0 : u16 = 0;
+
+fn transport_errors() u16 {
+    return xp.xp_errors() + xp.xp_lane_rx_errors() + xp.xp_lane_tx_errors();
+}
+
+// Called by pass_prepare, BEFORE any message of the pass can arrive. The
+// transport is idle: the previous pass is complete on this PE.
+fn transport_prepare(pass: u16) void {
+    const b : u16 = pass * HDR_F;
+    tr_n_rx = mp_hdr[b];
+    var e0 : u16 = mp_hdr[b + 5];
+    for (@range(u16, 4)) |o| {
+        tr_arr[o] = mp_hdr[b + 1 + o];
+        tr_got[o] = 0;
+        out_ne[o] = mp_hdr[b + 6 + o];
+        out_e0[o] = e0;
+        e0 += out_ne[o];
+        out_e[o] = 0;
+        out_zoff[o] = 0;
+    }
+    tr_rx = 0;
+    eng_first[0] = 0;
+    eng_first[1] = 0;
+    err0 = transport_errors();
+    xp.xp_start(tr_arr[0], tr_arr[1], tr_arr[2], tr_arr[3]);
+}
+
+// Own message of output o: the next box run of its current entry. Returns
+// false when the output has no own message left. Sets the destination, the
+// header, the payload and its length.
+fn next_own(o: u16, dx: *u16, dy: *u16, hdr: *u32, payload: *[*]u32, plen: *u16) bool {
+    if (out_e[o] >= out_ne[o]) return false;
+    const eb : u16 = (out_e0[o] + out_e[o]) * 3;
+    const w : u16 = mp_ent[eb + 2];
+    const zb0 : u16 = w & 0xFF;
+    const zn : u16 = w >> 8;
+    const per : u16 = if (cur_pass == PASS_P2P) P2P_CELLS else cons.K_CUBES;
+    const zbase : u16 = zb0 + out_zoff[o];
+    var zcount : u16 = zn - out_zoff[o];
+    if (zcount > per) zcount = per;
+    if (cur_pass == PASS_P2P) {
+        payload.* = @ptrcast([*]u32, &bodies_col[(zbase - z0) * CELL_BLOCK]);
+        plen.* = zcount * CELL_BLOCK;
+    } else {
+        const src = pass_data_ptr(cur_pass);
+        payload.* = @ptrcast([*]u32, &src[(zbase - level_zbase(pass_dlevel)) * cons.C_BUF_SIZE]);
+        plen.* = zcount * cons.C_BUF_SIZE;
+    }
+    dx.* = mp_ent[eb];
+    dy.* = mp_ent[eb + 1];
+    hdr.* = build_header(pe_x, pe_y, cur_kind, pass_dlevel, zcount, zbase);
+    out_zoff[o] += zcount;
+    if (out_zoff[o] >= zn) {
+        out_e[o] += 1;
+        out_zoff[o] = 0;
+    }
+    return true;
+}
+
+// Engine e (0 = E+N, 1 = W+S): an owed credit or a relay first (xport), else
+// the next own message of one of its directions (e, e + 2) that holds a
+// credit, alternating between them.
+fn send_eng(e: u16) void {
+    if (xp.xp_busy(e)) return;
+    if (xp.xp_pump(e)) return;
+    if (pass_started == 0) return;
+    var i : u16 = 0;
+    while (i < 2) {
+        const o : u16 = if (((eng_first[e] + i) & 1) == 0) e else e + 2;
+        if (xp.xp_can_send(o)) {
+            var dx : u16 = 0; var dy : u16 = 0; var h : u32 = 0;
+            var pl : [*]u32 = @ptrcast([*]u32, &mp_ent[0]); var n : u16 = 0;
+            if (next_own(o, &dx, &dy, &h, &pl, &n)) {
+                tsc_mark(1 + cur_pass, 1);
+                eng_first[e] = 1 - eng_first[e];
+                xp.xp_send(o, h, xp.xp_h1(dx, dy, n), pl);
+                return;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn send_all() void {
+    send_eng(0);
+    send_eng(1);
+}
+
+// Own sends at the launch of the pass (called by pass_begin).
+fn transport_start() void {
+    send_all();
+}
+
+fn transport_check_done() void {
+    if (pass_done == 1 or pass_started == 0) return;
+    if (tr_rx != tr_n_rx) return;
+    for (@range(u16, 4)) |o| {
+        if (tr_got[o] != tr_arr[o] or out_e[o] < out_ne[o]) return;
+    }
+    if (!xp.xp_idle()) return;
+    pass_stats[7] += @as(u32, transport_errors() - err0);
+    pass_complete();
+}
+
+// An arrival on port d: a credit, a relay queued in xport, or a final message
+// consumed here (then its slot is released: the credit goes back).
+fn on_rx(d: u16) void {
+    const ev : u16 = xp.xp_rx_step(d);
+    if (ev == 0) return;                       // header received, payload armed
+    if (pass_active == 0 or pass_done == 1) pass_stats[5] += 1;   // stray
+    tsc_mark(1 + cur_pass, 1);
+    tr_got[d] += 1;
+    pass_stats[3] += 1;
+    if (tr_got[d] > tr_arr[d]) pass_stats[7] += 1;
+    if (ev == 3) {
+        tr_rx += 1;
+        pass_stats[0] += 1;
+        if (tr_rx > tr_n_rx) pass_stats[7] += 1;
+        const b = xp.xp_slot(d);
+        pass_consume(b[0], @ptrcast([*]f32, &b[2]));
+        xp.xp_release(d);
+    }
+    send_all();                                // a relay, a credit owed or received
+    transport_check_done();
+}
+
+fn on_tx(d: u16) void {
+    const ev : u16 = xp.xp_tx_step(d);
+    if (ev == 0) return;                       // prefix done, payload op launched
+    if (ev == 2) pass_stats[1] += 1;           // relay (straight or turn) done
+    if (ev == 3) pass_stats[2] += 1;           // own message done
+    send_all();
+    transport_check_done();
+}
+
+task lane_e_rx_task() void { on_rx(0); }
+task lane_w_rx_task() void { on_rx(1); }
+task lane_n_rx_task() void { on_rx(2); }
+task lane_s_rx_task() void { on_rx(3); }
+task lane_e_tx_task() void { on_tx(0); }
+task lane_w_tx_task() void { on_tx(1); }
+task lane_n_tx_task() void { on_tx(2); }
+task lane_s_tx_task() void { on_tx(3); }
+
+// ===========================================================================
+// P2M  (phase b core: zero communication)
+// ===========================================================================
+// For each leaf cell of this PE, build its 3D multipole from the bodies stored
+// in that cell's block. Writes into m_leaf[local index].
+//
+// Body positions are absolute (domain coordinates); the multipole is expanded
+// about the cell center (center_x, center_y, cz) where cz depends on z.
+
+fn cell_center_z(z: u16) f32 {
+    return (@as(f32, z) + 0.5) * cell_size;
+}
+
+fn compute_p2m_cell(n: u16) void {
+    // Pointer to this cell's slot in the leaf multipole buffer (local index n,
+    // global z = z0 + n).
+    const m_base : u16 = n * cons.C_BUF_SIZE;
+
+    // Clear this cell's multipole accumulator.
+    for (@range(u16, cons.C_BUF_SIZE)) |i| {
+        m_leaf[m_base + i] = 0.0;
+    }
+
+    const blk : u16 = n * CELL_BLOCK;
+    const count : u16 = @as(u16, bodies_col[blk]);
+    const body0 : u16 = blk + 1;
+
+    const cz : f32 = cell_center_z(z0 + n);
+
+    for (@range(u16, count)) |b| {
+        const ib : u16 = body0 + b * 4;
+        const bx : f32 = @bitcast(f32, bodies_col[ib]);
+        const by : f32 = @bitcast(f32, bodies_col[ib + 1]);
+        const bz : f32 = @bitcast(f32, bodies_col[ib + 2]);
+        const q  : f32 = @bitcast(f32, bodies_col[ib + 3]);
+
+        const dx : f32 = bx - center_x;
+        const dy : f32 = by - center_y;
+        const dz : f32 = bz - cz;
+
+        // Solid harmonics of this body's offset, into scratch.
+        kernels.compute_solid_harmonics(dx, dy, dz, &contrib_buf);
+
+        // Accumulate q * contrib into this cell's multipole.
+        // (fmacs: SIMD-4 add path; the scalar fmul is inside compute_solid_harmonics.)
+        const m_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.C_BUF_SIZE} -> m_leaf[i] });
+        var m_dsd_cell = @set_dsd_base_addr(m_dsd, @ptrcast([*]f32, &m_leaf[m_base]));
+        const c_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{cons.C_BUF_SIZE} -> contrib_buf[i] });
+        @fmacs(m_dsd_cell, m_dsd_cell, c_dsd, q);
+    }
+}
+
+// Run P2M for every leaf cell of this PE.
+fn compute_p2m_column() void {
+    for (@range(u16, cons.ZP)) |n| {
+        compute_p2m_cell(n);
+    }
+}
+
+
+// ===========================================================================
+// M2M / L2L  (z-local math; the plane part is done by passes M2M* / L2L*)
+// ===========================================================================
+//
+// A tree node (box) spans, on the plane, an s x s block of columns (s =
+// cells_per_box(parent_level)). Its 8 children split into:
+//   - 2 Z children: same (X,Y) column, Z indices (2*pz, 2*pz+1);
+//   - 6 PLANE children: other columns.
+// Each PE translates the children it holds to the PARENT centre, into the
+// parent's node (its own box or a staging slot, see RESIDENT STATE), ZERO hops
+// (m2m_z_local); the combine of the partials is then a plain add at the
+// parent's owner (passes M2M c->c-1). Downward, the owner's local expansion is
+// copied to every PE holding a child (passes L2L p->p+1), which translates it
+// to its children (l2l_z_local).
+//
+// child_id bits: bit0 = X, bit1 = Y, bit2 = Z (matches get_translation_vector).
+// For the Z-local pair, the X,Y bits are this PE's offset within the parent
+// block (relative to the parent representative); the Z bit is 0 / 1.
+//
+// Buffer pointer helpers: each level buffer is flat [nodes * C_BUF_SIZE]; local
+// node n starts at n * C_BUF_SIZE.
+
+// Nodes of level `level` on this PE (see RESIDENT STATE): ZP / 2**(H-level),
+// at least 1.
+fn level_nodes(level: u16) u16 {
+    const sh : u16 = cons.TREE_H - level;
+    if (sh <= cons.LZP) return @as(u16, 1) << (cons.LZP - sh);
+    return 1;
+}
+
+// Global z of local node 0 of `level`: the box containing cell z0.
+fn level_zbase(level: u16) u16 {
+    return z0 >> (cons.TREE_H - level);
+}
+
+// True if this PE owns its level-`level` node(s), i.e. holds the lowest cell
+// of the box (always true when the box is not taller than ZP); false: the
+// node is a staging slot.
+fn level_held(level: u16) bool {
+    const sh : u16 = cons.TREE_H - level;
+    return (z0 & ((@as(u16, 1) << sh) - 1)) == 0;
+}
+
+// First float of each level in the packed coarse buffers (levels 2..H-1),
+// filled once by init_coarse_offsets (z0 is not needed: it only depends on
+// level_nodes).
+var coarse_off = @zeros([cons.TREE_H + 1]u16);
+
+fn init_coarse_offsets() void {
+    var n : u16 = 0;
+    var j : u16 = 2;
+    while (j < cons.TREE_H) {
+        coarse_off[j] = n * cons.C_BUF_SIZE;
+        n += level_nodes(j);
+        j += 1;
+    }
+}
+
+fn coarse_offset(level: u16) u16 {
+    return coarse_off[level];
+}
+
+fn m_level_ptr(level: u16) *[cons.C_BUF_SIZE]f32 {
+    // Pointer to node 0 of the level; the caller offsets by node index.
+    // Only levels 2..H are stored (see RESIDENT COLUMN STATE).
+    if (level == cons.TREE_H) return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_leaf[0]);
+    return @ptrcast(*[cons.C_BUF_SIZE]f32, &m_coarse[coarse_offset(level)]);
+}
+
+fn l_level_ptr(level: u16) *[cons.C_BUF_SIZE]f32 {
+    if (level == cons.TREE_H) return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_leaf[0]);
+    return @ptrcast(*[cons.C_BUF_SIZE]f32, &l_coarse[coarse_offset(level)]);
+}
+
+// This PE's (X,Y) offset bits within the block of a box at `parent_level`.
+// The parent box representative is aligned to cells_per_box(parent_level).
+// The child cells are aligned to cells_per_box(parent_level+1) = half. So the
+// X,Y child_id bits are (pe_x / child_s) & 1, (pe_y / child_s) & 1, where
+// child_s = cells_per_box(child_level).
+fn plane_child_bits(child_level: u16, bit_x: *u16, bit_y: *u16) void {
+    const child_s : u16 = geom.cells_per_box(child_level);
+    bit_x.* = (pe_x / child_s) & 1;
+    bit_y.* = (pe_y / child_s) & 1;
+}
+
+// Z-LOCAL M2M: translate every child this PE holds at child_level into its
+// parent's node at child_level - 1 (own box or staging slot), accumulating.
+// Children in increasing z: for a parent, z child 0 then z child 1. Pure,
+// local, zero communication. Called only where level_held(child_level).
+fn m2m_z_local(child_level: u16) void {
+    const parent_level : u16 = child_level - 1;
+    const nc : u16 = level_nodes(child_level);
+    const cz0 : u16 = level_zbase(child_level);
+    const pz0 : u16 = level_zbase(parent_level);
+
+    const child_m = m_level_ptr(child_level);
+    const parent_m = m_level_ptr(parent_level);
+
+    var bit_x : u16 = 0;
+    var bit_y : u16 = 0;
+    plane_child_bits(child_level, &bit_x, &bit_y);
+
+    for (@range(u16, nc)) |cn| {
+        const cz : u16 = cz0 + cn;
+        const pn : u16 = (cz >> 1) - pz0;
+        // child_id: X,Y bits fixed by this PE's block offset, Z bit = cz & 1.
+        const cid : u16 = bit_x | (bit_y << 1) | ((cz & 1) << 2);
+
+        // Translation vector child -> parent, then its harmonics into v_buf.
+        //
+        // SIGN CONVENTION (verified numerically against a direct reference, rel
+        // ~1e-15): the representative/parent is the LOW corner (min pe_x, pe_y,
+        // low Z). get_translation_vector gives +half for child_id bit 0, but a
+        // low-corner child's center lies BELOW the parent center, so the true
+        // child->parent offset is NEGATED. get_translation_vector is called with
+        // CHILD_level (its half_child_size = child box half-side = the offset
+        // magnitude). This matches how the 3D L2L negated its vector.
+        var t_vec = @zeros([3]f32);
+        geom.get_translation_vector(@as(u32, cid), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_m.*[cn * cons.C_BUF_SIZE]);
+        var par = @ptrcast(*[cons.C_BUF_SIZE]f32, &parent_m.*[pn * cons.C_BUF_SIZE]);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &child.*[0]), @ptrcast([*]f32, &par.*[0]),
+            @ptrcast([*]u16, &m2m_offsets[0]), @ptrcast([*]u16, &m2m_child_indices[0]),
+            @ptrcast([*]u16, &m2m_v_indices[0]), @ptrcast([*]u32, &m2m_signs[0]));
+    }
+}
+
+// Z-LOCAL L2L: propagate the parent local expansion (own box or staging copy)
+// to every child this PE holds at parent_level + 1. Mirror of m2m_z_local; the
+// translation vector is parent -> child (negated). Called only where
+// level_held(parent_level + 1).
+fn l2l_z_local(parent_level: u16) void {
+    const child_level : u16 = parent_level + 1;
+    const nc : u16 = level_nodes(child_level);
+    const cz0 : u16 = level_zbase(child_level);
+    const pz0 : u16 = level_zbase(parent_level);
+
+    const parent_l = l_level_ptr(parent_level);
+    const child_l = l_level_ptr(child_level);
+
+    var bit_x : u16 = 0;
+    var bit_y : u16 = 0;
+    plane_child_bits(child_level, &bit_x, &bit_y);
+
+    for (@range(u16, nc)) |cn| {
+        const cz : u16 = cz0 + cn;
+        const pn : u16 = (cz >> 1) - pz0;
+        const cid : u16 = bit_x | (bit_y << 1) | ((cz & 1) << 2);
+
+        // L2L uses the SAME sign/level convention as the 3D code: harmonics of
+        // the NEGATED get_translation_vector(child_id, CHILD_level). This was
+        // validated end-to-end in 3D. (A standalone unit test for L2L needs a
+        // physical far-source field; it is deferred to the end-to-end force
+        // check against direct N-body, which is the authoritative L2L test.)
+        var t_vec = @zeros([3]f32);
+        var par = @ptrcast(*[cons.C_BUF_SIZE]f32, &parent_l.*[pn * cons.C_BUF_SIZE]);
+        geom.get_translation_vector(@as(u32, cid), child_level, &t_vec);
+        kernels.compute_solid_harmonics(-t_vec[0], -t_vec[1], -t_vec[2], &v_buf);
+        var child = @ptrcast(*[cons.C_BUF_SIZE]f32, &child_l.*[cn * cons.C_BUF_SIZE]);
+        kernels.translate(
+            @ptrcast([*]f32, &v_buf[0]), @ptrcast([*]f32, &par.*[0]), @ptrcast([*]f32, &child.*[0]),
+            @ptrcast([*]u16, &l2l_offsets[0]), @ptrcast([*]u16, &l2l_source_indices[0]),
+            @ptrcast([*]u16, &l2l_v_indices[0]), @ptrcast([*]u32, &l2l_signs[0]));
+    }
+}
+
+
+
+// ===========================================================================
+// P2P  (near field: direct sum over the cells at |dx|, |dy|, |dz| <= 1)
+// ===========================================================================
+// The local part (source cells on this PE, 0 hops) runs at the begin of pass
+// P2P; the other neighbour cells (plane-neighbour columns, and the adjacent
+// cells of the own column on the other chunks) arrive as messages.
+const math_mod = @import_module("<math>");
+fn math_sqrt(x: f32) f32 { return math_mod.sqrt(x); }
+
+// Force and potential on every body of target cell tn (local index) of this
+// PE from the bodies of ONE source cell block `src` (layout of bodies_col:
+// count, then x, y, z, q per body). Pairs with r2 <= 1e-10 (a body with
+// itself) are skipped. Accumulates into forces_col.
+fn p2p_accumulate(tn: u16, src: [*]u32) void {
+    const scount : u16 = @as(u16, src[0]);
+    const tblk : u16 = tn * CELL_BLOCK;
+    const tcount : u16 = @as(u16, bodies_col[tblk]);
+    const fcell_base : u16 = tn * (max_bodies_pe * 4);
+    for (@range(u16, tcount)) |ti| {
+        const ib : u16 = tblk + 1 + ti * 4;
+        const tx : f32 = @bitcast(f32, bodies_col[ib]);
+        const ty : f32 = @bitcast(f32, bodies_col[ib + 1]);
+        const tzc : f32 = @bitcast(f32, bodies_col[ib + 2]);
+        var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0; var pot : f32 = 0.0;
+        for (@range(u16, scount)) |ri| {
+            const rb : u16 = 1 + ri * 4;
+            const ddx = @bitcast(f32, src[rb]) - tx;
+            const ddy = @bitcast(f32, src[rb + 1]) - ty;
+            const ddz = @bitcast(f32, src[rb + 2]) - tzc;
+            const rq : f32 = @bitcast(f32, src[rb + 3]);
+            const r2 = ddx*ddx + ddy*ddy + ddz*ddz;
+            if (r2 > 1e-10) {
+                const rinv = 1.0 / math_sqrt(r2);
+                const ff = rq * rinv * rinv * rinv;
+                fx += ff * ddx; fy += ff * ddy; fz += ff * ddz;
+                pot += rq * rinv;
+            }
+        }
+        const fo : u16 = fcell_base + ti * 4;
+        forces_col[fo]     += fx;
+        forces_col[fo + 1] += fy;
+        forces_col[fo + 2] += fz;
+        forces_col[fo + 3] += pot;
+    }
+    pass_stats[4] += 1;     // (target cell, source cell) pairs (diagnostic)
+}
+
+// Source cell sz (global z, of this or a neighbour column) acts on the target
+// cells sz-1, sz, sz+1 held by this PE (z0 .. z0 + ZP - 1).
+fn p2p_from_cell(sz: u16, src: [*]u32) void {
+    var tz : u16 = if (sz > z0) sz - 1 else z0;
+    while (tz <= sz + 1 and tz < z0 + cons.ZP) {
+        p2p_accumulate(tz - z0, src);
+        tz += 1;
+    }
+}
+
+// Local part: every cell of this PE on its own and z-adjacent cells of this PE.
+fn p2p_column_local() void {
+    var n : u16 = 0;
+    while (n < cons.ZP) {
+        p2p_from_cell(z0 + n, @ptrcast([*]u32, &bodies_col[n * CELL_BLOCK]));
+        n += 1;
+    }
+}
+
+
+// ===========================================================================
+// CYCLE COUNTER  (per-PE timestamps of every step, read by the host at the end)
+// ===========================================================================
+// <time>: enable_tsc() (called once, first thing in run_p2m) resets this PE's
+// 48-bit timestamp counter; get_timestamp() returns it as 3 u16, least
+// significant first. Counters of different PEs are NOT synchronized: only
+// per-PE durations are meaningful.
+//
+// Steps: 0 = P2M, 1 + p = pass p, TSC_NSTEP - 1 = L2P (= the step
+// id written to fmm_done, minus 1). Markers per step:
+//   0 = the launch reached this PE (entry of the exported fn)
+//   1 = first event of the step on this PE: first rx or first own send. It can
+//       PRECEDE marker 0 (a PE can receive before its own launch).
+//   2 = step complete on this PE (phase_signal_done)
+// tsc_log[(step * 3 + marker) * 3 + w] = word w of the timestamp, stored as
+// u32 so the host reads it with the u32 memcpy helper. Unwritten markers stay 0.
+const TSC_NSTEP : u16 = NPASS + 2;
+var tsc_log = @zeros([TSC_NSTEP * 9]u32);   // read by the host via ptr_tsc_log
+var tsc_first = @zeros([TSC_NSTEP]u16);    // marker 1 already written
+
+fn tsc_mark(step: u16, marker: u16) void {
+    if (marker == 1) {
+        if (tsc_first[step] == 1) return;
+        tsc_first[step] = 1;
+    }
+    var t = @zeros([3]u16);
+    time_mod.get_timestamp(&t);
+    const b : u16 = (step * 3 + marker) * 3;
+    tsc_log[b] = @as(u32, t[0]);
+    tsc_log[b + 1] = @as(u32, t[1]);
+    tsc_log[b + 2] = @as(u32, t[2]);
+}
+
+
+// ===========================================================================
+// ENTRY POINTS  (host-mediated barriers)
+// ===========================================================================
+//
+// PROTOCOL (one rule for every exported fn):
+//   - it calls sys_mod.unblock_cmd_stream() EXACTLY ONCE, as its last
+//     statement, whether or not its work is complete;
+//   - when this PE's step is TRULY complete (possibly later, from a task) it
+//     writes the step id into fmm_done[0]; the host polls fmm_done until every
+//     PE shows the step id, which is the global barrier;
+//   - the state of the next step is prepared before any of its messages can
+//     arrive (PEs do not enter a launch simultaneously). fmm_done is never
+//     cleared, so an early completion is not lost either.
+// Host sequence and step ids:
+//   run_p2m (1) -> run_pass x NPASS (2 .. NPASS+1, see PASSES) -> run_l2p
+//   (NPASS+2). C = 16: 8 passes, run_l2p = 10.
+const STEP_P2M : u32 = 1;
+const STEP_PASS0 : u32 = 2;
+const STEP_L2P : u32 = 2 + @as(u32, NPASS);   // 10 at C=16
+
+fn phase_signal_done(step: u32) void {
+    tsc_mark(@as(u16, step) - 1, 2);
+    fmm_done[0] = step;
+}
+
+// Position from the fabric coordinates (absolute, = rectangle offset +
+// position: verified on 4096/4096 PEs on hardware) and the block
+// snake of pe_map.PeMap.pe_to_column: block (pe_x, pe_y) at (pe_x << lbw,
+// pe_y << lbh); inside it rows alternate direction.
+fn init_position() void {
+    fab_x = @as(u16, tc.get_fabric_coord(tc.fabric_coord.X)) - @get_rectangle().offsets.width;
+    fab_y = @as(u16, tc.get_fabric_coord(tc.fabric_coord.Y)) - @get_rectangle().offsets.height;
+    const blk_w : u16 = @as(u16, 1) << blk_lbw;
+    const blk_h : u16 = @as(u16, 1) << blk_lbh;
+    const kx : u16 = fab_x & (blk_w - 1);
+    const ky : u16 = fab_y & (blk_h - 1);
+    const kxs : u16 = if ((ky & 1) == 1) (blk_w - 1) - kx else kx;
+    pe_x = fab_x >> blk_lbw;
+    pe_y = fab_y >> blk_lbh;
+    pe_k = (ky << blk_lbw) | kxs;
+    z0 = pe_k << cons.LZP;
+    init_coarse_offsets();
+    center_x = (@as(f32, pe_x) + 0.5) * cell_size;
+    center_y = (@as(f32, pe_y) + 0.5) * cell_size;
+}
+
+fn clear_level_buffers() void {
+    for (@range(u16, N_COARSE * cons.C_BUF_SIZE)) |i| { m_coarse[i] = 0.0; }
+    for (@range(u16, cons.ZP * cons.C_BUF_SIZE)) |i| { l_leaf[i] = 0.0; }
+    for (@range(u16, N_COARSE * cons.C_BUF_SIZE)) |i| { l_coarse[i] = 0.0; }
+}
+
+// P2M, then the local start of the upward pass: every PE translates its leaf
+// multipoles into its level H-1 partials about the parent centres (summed at
+// the parents' owners by the first M2M pass).
+export fn run_p2m() void {
+    time_mod.enable_tsc();       // resets this PE's counter: once per run
+    tsc_mark(0, 0);
+    tsc_mark(0, 1);
+    init_position();
+    xp.xp_init(fab_x, fab_y);    // transport state; no traffic before the host
+                                 // launches the first pass (barrier)
+    for (@range(u16, cons.ZP * max_bodies_pe * 4)) |i| {
+        forces_col[i] = 0.0;
+    }
+    compute_p2m_column();
+    clear_level_buffers();
+    m2m_z_local(cons.TREE_H);
+    pass_prepare(0);
+    phase_signal_done(STEP_P2M);
+    sys_mod.unblock_cmd_stream();
+}
+
+// Launch the prepared pass (the host calls this once per pass).
+export fn run_pass() void {
+    tsc_mark(1 + cur_pass, 0);
+    pass_begin();
+    sys_mod.unblock_cmd_stream();
+}
+
+export fn run_l2p() void {
+    // Evaluate the leaf local expansion at each body; accumulate far-field force
+    // (forces_col already holds the near field of pass P2P).
+    tsc_mark(TSC_NSTEP - 1, 0);
+    tsc_mark(TSC_NSTEP - 1, 1);
+    var n : u16 = 0;
+    while (n < cons.ZP) {
+        const blk : u16 = n * CELL_BLOCK;
+        const count : u16 = @as(u16, bodies_col[blk]);
+        const body0 : u16 = blk + 1;
+        const cz : f32 = cell_center_z(z0 + n);
+        const fcell_base : u16 = n * (max_bodies_pe * 4);
+        var lexp = @ptrcast(*[cons.C_BUF_SIZE]f32, &l_leaf[n * cons.C_BUF_SIZE]);
+        for (@range(u16, count)) |b| {
+            const ib : u16 = body0 + b * 4;
+            const bx : f32 = @bitcast(f32, bodies_col[ib]);
+            const by : f32 = @bitcast(f32, bodies_col[ib + 1]);
+            const bz : f32 = @bitcast(f32, bodies_col[ib + 2]);
+            const ddx = bx - center_x;
+            const ddy = by - center_y;
+            const ddz = bz - cz;
+            var pot : f32 = 0.0; var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0;
+            kernels.evaluate_l2p(ddx, ddy, ddz, lexp, &pot, &fx, &fy, &fz);
+            const fo : u16 = fcell_base + b * 4;
+            forces_col[fo]     += fx;
+            forces_col[fo + 1] += fy;
+            forces_col[fo + 2] += fz;
+            forces_col[fo + 3] += pot;
+        }
+        n += 1;
+    }
+    phase_signal_done(STEP_L2P);
+    sys_mod.unblock_cmd_stream();
+}
+
+
+// ===========================================================================
+// HOST POINTERS
+// ===========================================================================
+var ptr_bodies_col : [*]u32 = &bodies_col;
+var ptr_forces_col : [*]f32 = &forces_col;
+var ptr_fmm_done : [*]u32 = &fmm_done;
+
+var ptr_m2m_offsets : [*]u16 = &m2m_offsets;
+var ptr_m2m_child_indices : [*]u16 = &m2m_child_indices;
+var ptr_m2m_v_indices : [*]u16 = &m2m_v_indices;
+var ptr_m2m_signs : [*]u32 = &m2m_signs;
+
+var ptr_m2l_offsets : [*]u16 = &m2l_offsets;
+var ptr_m2l_source_indices : [*]u16 = &m2l_source_indices;
+var ptr_m2l_v_indices : [*]u16 = &m2l_v_indices;
+var ptr_m2l_signs : [*]u32 = &m2l_signs;
+
+var ptr_l2l_offsets : [*]u16 = &l2l_offsets;
+var ptr_l2l_source_indices : [*]u16 = &l2l_source_indices;
+var ptr_l2l_v_indices : [*]u16 = &l2l_v_indices;
+var ptr_l2l_signs : [*]u32 = &l2l_signs;
+
+var ptr_pass_stats : [*]u32 = &pass_stats;
+var ptr_pass_stats_all : [*]u32 = &pass_stats_all;
+var ptr_l_leaf : [*]f32 = &l_leaf;
+var ptr_tsc_log : [*]u32 = &tsc_log;
+var ptr_mp_hdr : [*]u16 = &mp_hdr;
+var ptr_mp_ent : [*]u16 = &mp_ent;
+
+
+// ===========================================================================
+// COMPTIME
+// ===========================================================================
+comptime {
+    @comptime_assert(P2P_CELLS >= 1);   // max_bodies_pe too large for one cell
+
+    // Transport: static routes, queues and colors are set up at comptime by
+    // lane.csl (imported four times by xport.csl).
+    @bind_local_task(lane_e_rx_task, cons.lane_e_rx_id);
+    @bind_local_task(lane_e_tx_task, cons.lane_e_tx_id);
+    @bind_local_task(lane_w_rx_task, cons.lane_w_rx_id);
+    @bind_local_task(lane_w_tx_task, cons.lane_w_tx_id);
+    @bind_local_task(lane_n_rx_task, cons.lane_n_rx_id);
+    @bind_local_task(lane_n_tx_task, cons.lane_n_tx_id);
+    @bind_local_task(lane_s_rx_task, cons.lane_s_rx_id);
+    @bind_local_task(lane_s_tx_task, cons.lane_s_tx_id);
+
+    @export_symbol(ptr_bodies_col, "ptr_bodies_col");
+    @export_symbol(ptr_forces_col, "ptr_forces_col");
+    @export_symbol(ptr_fmm_done, "ptr_fmm_done");
+    @export_symbol(run_p2m, "run_p2m");
+    @export_symbol(run_pass, "run_pass");
+    @export_symbol(run_l2p, "run_l2p");
+
+    @export_symbol(ptr_m2m_offsets, "ptr_m2m_offsets");
+    @export_symbol(ptr_m2m_child_indices, "ptr_m2m_child_indices");
+    @export_symbol(ptr_m2m_v_indices, "ptr_m2m_v_indices");
+    @export_symbol(ptr_m2m_signs, "ptr_m2m_signs");
+
+    @export_symbol(ptr_m2l_offsets, "ptr_m2l_offsets");
+    @export_symbol(ptr_m2l_source_indices, "ptr_m2l_source_indices");
+    @export_symbol(ptr_m2l_v_indices, "ptr_m2l_v_indices");
+    @export_symbol(ptr_m2l_signs, "ptr_m2l_signs");
+
+    @export_symbol(ptr_l2l_offsets, "ptr_l2l_offsets");
+    @export_symbol(ptr_l2l_source_indices, "ptr_l2l_source_indices");
+    @export_symbol(ptr_l2l_v_indices, "ptr_l2l_v_indices");
+    @export_symbol(ptr_l2l_signs, "ptr_l2l_signs");
+
+    @export_symbol(ptr_pass_stats, "ptr_pass_stats");
+    @export_symbol(ptr_pass_stats_all, "ptr_pass_stats_all");
+    @export_symbol(ptr_l_leaf, "ptr_l_leaf");
+    @export_symbol(ptr_tsc_log, "ptr_tsc_log");
+    @export_symbol(ptr_mp_hdr, "ptr_mp_hdr");
+    @export_symbol(ptr_mp_ent, "ptr_mp_ent");
+}

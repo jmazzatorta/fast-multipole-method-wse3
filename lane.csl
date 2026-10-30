@@ -1,0 +1,205 @@
+// lane.csl - one static neighbour lane (one direction) of the all-static
+// transport (xport.csl).
+//
+// Hardware message passing merges two messages on some links, horizontal and
+// vertical, also one-row hops crossing head-on (measured on the CS-3 systems at ALCF);
+// static neighbour routes do not. A lane moves a message ONE PE, from
+// this PE's core to the neighbour's core in direction `dir`; the importer
+// (xport.csl) forwards it, consumes it or turns it. Import once per direction.
+//
+// Wire format: [h0][h1][payload: len words]
+//   h0 = our header (opaque here)
+//   h1 = final destination (fabric, relative to the rectangle) and length:
+//        fx | fy << 10 | len << 20 (lane_h1(); fx, fy < 1024, len < 4096)
+//   len == 0: a CREDIT (2 words, no payload).
+// Receive: the 2-word header goes into an internal header area that is re-armed
+// at once; a data message (len > 0) then has its payload received into this
+// lane's single data slot at slot + 2, the header copied in front (so the slot
+// holds [h0][h1][payload] and can be forwarded in one op). The importer must
+// guarantee (credits) that a data message arrives only while the slot is free;
+// credits always get in, even while the slot is held.
+// Send: a 2-word prefix then len payload words in place (lane_send, zero copy),
+// one op of a whole held message (lane_forward), or a credit (lane_credit). One
+// send at a time per lane; lanes may share a send microthread (WSE-3) if
+// the importer never starts two sends on it at once.
+//
+// Colors by parity: a PE sends on the color of its parity and receives on the
+// other one, so sender-out == receiver-in on every hop. Parity = column parity
+// for E / W lanes, row parity for N / S lanes.
+
+param dir : u16;                // 0 E, 1 W, 2 N, 3 S: direction of travel (sends)
+param parity : u16;             // pe_x % 2 for E / W, pe_y % 2 for N / S
+param color_even : color;
+param color_odd : color;
+param iq_id : u16;
+param oq_id : u16;
+param rx_ut_id : u16;              // receive microthread: this lane only
+param tx_ut_id : u16;              // send microthread: may be shared with another lane
+param max_len : u16;               // payload words after h0, h1
+param rx_task_id : local_task_id;  // activated by each receive stage
+param tx_task_id : local_task_id;  // activated by each send stage
+
+const c_out : color = if (parity == 0) color_even else color_odd;
+const c_in : color = if (parity == 0) color_odd else color_even;
+const iq = @get_input_queue(iq_id);
+const oq = @get_output_queue(oq_id);
+const RX_UT = @get_ut_id(rx_ut_id);
+const TX_UT = @get_ut_id(tx_ut_id);
+
+const out_dsd = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = oq });
+const in_dsd = @get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = iq });
+
+var dummy = @zeros([1]u32);
+var prefix = @zeros([2]u32);
+var hdr = @zeros([2]u32);                  // header area, always re-armed
+var slot = @zeros([max_len + 3]u32);       // [h0][h1][payload] + spare word
+
+fn lane_h1(fx: u16, fy: u16, len: u16) u32 {
+    return @as(u32, fx) | (@as(u32, fy) << 10) | (@as(u32, len) << 20);
+}
+fn lane_fx(h1: u32) u16 { return @as(u16, h1 & 0x3FF); }
+fn lane_fy(h1: u32) u16 { return @as(u16, (h1 >> 10) & 0x3FF); }
+fn lane_len(h1: u32) u16 { return @as(u16, h1 >> 20); }
+fn lane_slot() [*]u32 { return @ptrcast([*]u32, &slot[0]); }
+
+// --- Send -------------------------------------------------------------------
+var tx_stage : u16 = 0;          // 0 idle, 1 prefix in flight, 2 last op in flight
+var tx_payload : [*]u32 = &dummy;
+var tx_n : u16 = 0;
+var tx_errors : u16 = 0;
+
+fn lane_tx_errors() u16 { return tx_errors; }
+fn lane_tx_busy() bool { return tx_stage != 0; }
+
+fn launch(src_ptr: [*]u32, n: u16) void {
+    var src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+    src = @set_dsd_base_addr(src, src_ptr);
+    src = @set_dsd_length(src, n);
+    const dst = @set_dsd_length(out_dsd, n);
+    @mov32(dst, src, .{ .async = true, .ut_id = TX_UT, .activate = tx_task_id });
+}
+
+// Own message: prefix (h0, h1), then lane_len(h1) payload words in place. The
+// payload must not change until lane_tx_step() returns true.
+fn lane_send(h0: u32, h1: u32, payload: [*]u32) void {
+    if (tx_stage != 0) {
+        tx_errors += 1;
+        return;
+    }
+    prefix[0] = h0;
+    prefix[1] = h1;
+    tx_payload = payload;
+    tx_n = lane_len(h1);
+    tx_stage = if (tx_n > 0) 1 else 2;
+    launch(@ptrcast([*]u32, &prefix[0]), 2);
+}
+
+// A held message forwarded unchanged: n words from buf (h0, h1, payload).
+fn lane_forward(buf: [*]u32, n: u16) void {
+    if (tx_stage != 0) {
+        tx_errors += 1;
+        return;
+    }
+    tx_stage = 2;
+    launch(buf, n);
+}
+
+// A credit for the neighbour in direction `dir`.
+fn lane_credit() void { lane_send(0, 0, @ptrcast([*]u32, &dummy[0])); }
+
+// Call from the task bound to tx_task_id. True when the message is out.
+fn lane_tx_step() bool {
+    if (tx_stage == 1) {
+        tx_stage = 2;
+        launch(tx_payload, tx_n);
+        return false;
+    }
+    if (tx_stage == 2) {
+        tx_stage = 0;
+        return true;
+    }
+    tx_errors += 1;
+    return false;
+}
+
+// --- Receive ----------------------------------------------------------------
+var rx_stage : u16 = 0;          // 0 idle, 1 header op armed, 2 payload op armed
+var rx_left : u16 = 0;           // messages (data + credits) still expected
+var rx_errors : u16 = 0;         // lengths beyond max_len (clamped)
+
+fn arm(dst_ptr: [*]u32, n: u16) void {
+    var mem = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+    mem = @set_dsd_base_addr(mem, dst_ptr);
+    mem = @set_dsd_length(mem, n);
+    const fab = @set_dsd_length(in_dsd, n);
+    @mov32(mem, fab, .{ .async = true, .ut_id = RX_UT, .activate = rx_task_id });
+}
+
+fn arm_header() void {
+    if (rx_left == 0) {
+        rx_stage = 0;
+        return;
+    }
+    rx_stage = 1;
+    arm(@ptrcast([*]u32, &hdr[0]), 2);
+}
+
+fn lane_rx_errors() u16 { return rx_errors; }
+
+// Start listening for n messages (data + credits) on this lane.
+fn lane_start(n: u16) void {
+    rx_left = n;
+    arm_header();
+}
+
+// Call from the task bound to rx_task_id: 0 a stage completed, 1 a credit
+// arrived, 2 a data message is in the slot (the header is re-armed already).
+// A length beyond max_len is clamped (counted in lane_rx_errors): the slot is
+// never overrun; the rest of that message then desynchronises the lane, which
+// the importer's checks see.
+fn lane_rx_step() u16 {
+    if (rx_stage == 1) {
+        var n : u16 = lane_len(hdr[1]);
+        if (n == 0) {
+            rx_left -= 1;
+            arm_header();
+            return 1;
+        }
+        if (n > max_len) {
+            rx_errors += 1;
+            n = max_len;
+        }
+        slot[0] = hdr[0];
+        slot[1] = hdr[1];
+        rx_stage = 2;
+        arm(@ptrcast([*]u32, &slot[2]), n);
+        return 0;
+    }
+    if (rx_stage != 2) {
+        rx_errors += 1;                     // activation with no receive armed
+        return 0;
+    }
+    rx_left -= 1;
+    arm_header();
+    return 2;
+}
+
+comptime {
+    @comptime_assert(dir < 4);
+    @comptime_assert(max_len >= 1 and max_len < 4093);
+    if (dir == 0) {
+        @set_local_color_config(c_out, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+        @set_local_color_config(c_in, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+    } else if (dir == 1) {
+        @set_local_color_config(c_out, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } } });
+        @set_local_color_config(c_in, .{ .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } } });
+    } else if (dir == 2) {
+        @set_local_color_config(c_out, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH } } });
+        @set_local_color_config(c_in, .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+    } else {
+        @set_local_color_config(c_out, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+        @set_local_color_config(c_in, .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+    }
+    @initialize_queue(iq, .{ .color = c_in });
+    @initialize_queue(oq, .{ .color = c_out });
+}
