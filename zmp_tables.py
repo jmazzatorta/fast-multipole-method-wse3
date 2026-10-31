@@ -29,9 +29,7 @@ Pairs with sender == receiver are local work, not messages. For each
 consecutive boxes = ENTRIES (dest_fx, dest_fy, zbase, zcount), zbase global
 along the column (as in the message header); the device splits an entry into
 messages of at most K_CUBES boxes (P2P: p2p_cells). Entry lists are sorted by
-(dest_fy, dest_fx, zbase) and rotated by (fx + 3 fy) mod n (as in GEN), unless
-set_send_order() picks another order (send-order experiment on hardware,
-docs/OPTIMIZATIONS.md section 7; the content is the same in every order).
+(dest_fy, dest_fx, zbase) and rotated by (fx + 3 fy) mod n (as in GEN).
 
 The plane and z parts are separable: per column pair the z relation is one of
 a few 1D relations, tabulated per (sender chunk, receiver chunk). check() is
@@ -40,7 +38,6 @@ an independent box-by-box (brute force) derivation for small meshes.
     python3 zmp_tables.py [MB] [C] [P] [ZP] [--check] [--regress]
       (default 4 32 4 8; --check: brute force, small meshes; --regress: GEN)
 """
-import random
 import sys
 from itertools import product
 
@@ -220,47 +217,18 @@ def runs(zs):
     return [tuple(r) for r in out]
 
 
-def gen_order(a, ents):
-    """GEN order of sender a's entries: sorted by (dest_fy, dest_fx, zbase),
-    rotated by (fx + 3 fy) mod n."""
-    ents = sorted(ents, key=lambda e: (e[1], e[0], e[2]))
-    r = (a[0] + 3 * a[1]) % len(ents)
-    return ents[r:] + ents[:r]
-
-
-def _dist(a, e):
-    return abs(e[0] - a[0]) + abs(e[1] - a[1])
-
-
-# Send orders of the hardware experiment (set_send_order); each maps sender a
-# and its entries to the list in send order.
-SEND_ORDERS = {
-    "gen": gen_order,
-    "rev": lambda a, ents: gen_order(a, ents)[::-1],
-    "near": lambda a, ents: sorted(gen_order(a, ents), key=lambda e: _dist(a, e)),
-    "far": lambda a, ents: sorted(gen_order(a, ents), key=lambda e: -_dist(a, e)),
-    "xgen": lambda a, ents: (lambda l, r: l[r:] + l[:r])(
-        sorted(ents, key=lambda e: (e[0], e[1], e[2])), (a[1] + 3 * a[0]) % len(ents)),
-    "random": lambda a, ents: random.Random(a[0] << 16 | a[1]).sample(
-        gen_order(a, ents), len(ents)),
-}
-_send_order = gen_order
-
-
-def set_send_order(name):
-    """Order of the entries of every sender (SEND_ORDERS; default gen)."""
-    global _send_order
-    _send_order = SEND_ORDERS[name]
-
-
 def pass_entries(pi):
-    """sender PE -> list of entries (dest_fx, dest_fy, zbase, zcount) in send
-    order (set_send_order)."""
+    """sender PE -> rotated list of entries (dest_fx, dest_fy, zbase, zcount)."""
     per = {}
     for (a, b), zs in sent(pi).items():
         for zb, zn in runs(zs):
             per.setdefault(a, []).append((b[0], b[1], zb, zn))
-    return {a: _send_order(a, ents) for a, ents in per.items()}
+    out = {}
+    for a, ents in per.items():
+        ents.sort(key=lambda e: (e[1], e[0], e[2]))
+        r = (a[0] + 3 * a[1]) % len(ents)
+        out[a] = ents[r:] + ents[:r]
+    return out
 
 
 def per_msg(pi, max_bodies_pe):
@@ -475,7 +443,7 @@ def _gen_layout(max_bodies_pe):
         ents = pass_entries(pi)
         n_rx, _ = pass_counts(pi, max_bodies_pe)
         for q in PES:
-            lst = gen_order(q, ents[q]) if q in ents else []
+            lst = ents.get(q, [])
             hdr[q[1], q[0], pi * 3:pi * 3 + 3] = (n_rx[q], len(lst), len(rows[q]))
             rows[q] += [(dx, dy, zb | (zn << 8)) for (dx, dy, zb, zn) in lst]
     cap = max(1, max(len(r) for r in rows.values()))

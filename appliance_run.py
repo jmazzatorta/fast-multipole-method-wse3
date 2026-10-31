@@ -585,9 +585,6 @@ def main():
                         help="target bodies of the direct-sum physics checks, drawn "
                              "with a fixed seed (0 = all bodies; the cost is "
                              "O(sample * N))")
-    parser.add_argument("--send-order", default="gen",
-                        help="order of each PE's sends (zmp_tables.SEND_ORDERS; "
-                             "hardware experiment, default gen)")
     parser.add_argument("--no-leaf-check", action="store_true",
                         help="do not read l_leaf back after the leaf M2L and the "
                              "last L2L pass: these reads stop the device between "
@@ -631,8 +628,6 @@ def main():
     blk_lbw = int(compile_data["params"]["blk_lbw"])
     configure_order(C, P, zp, blk_lbw)
     import zmp_tables
-    zmp_tables.set_send_order(args.send_order)
-    print(f"send order: {args.send_order}")
     pmap = zmp_tables.MAP
     assert pmap.lbh == int(compile_data["params"]["blk_lbh"])
     max_bodies_pe = int(compile_data["params"]["max_bodies_pe"])
@@ -896,7 +891,6 @@ def main():
         # offline: python appliance_run.py --verify-only runs/<label>_runNN
         np.savez(os.path.join(run_dir, "device_data.npz"), bodies=bodies,
                  C=C, order_p=P, zp=zp, blk_lbw=blk_lbw, max_bodies_pe=max_bodies_pe,
-                 send_order=args.send_order,
                  **{f"stats_{k}": v for k, v in pass_stats.items()},
                  **{f"leaf_{k}": v for k, v in leaf_checkpoints.items()},
                  **({"forces": forces_3d} if forces_3d is not None and STEP_L2P in completed else {}),
