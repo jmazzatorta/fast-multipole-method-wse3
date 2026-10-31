@@ -133,6 +133,8 @@ const lane_n_rx_id : local_task_id = @get_local_task_id(12);
 const lane_n_tx_id : local_task_id = @get_local_task_id(13);
 const lane_s_rx_id : local_task_id = @get_local_task_id(14);
 const lane_s_tx_id : local_task_id = @get_local_task_id(15);
+// M2L consume in pieces (pe.csl consume_task, D20).
+const consume_id : local_task_id = @get_local_task_id(22);
 
 
 comptime {

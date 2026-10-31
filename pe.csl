@@ -220,49 +220,63 @@ fn hdr_zbase(h: u32) u16 { return @as(u16, (h >> cons.SHIFT_ZBASE) & cons.MASK_8
 // every axis). (The previous guard 2 <= max|d| <= 3 had no parent test and
 // double-counted pairs already covered at the coarser level.)
 // Translation vector: d = (target - source) * box_size_at_level(level).
+//
+// The parent test in the plane is decided once per message (m2l_planar); the
+// rest per (source box, target box) pair (m2l_pair), shared by the local work
+// (apply_m2l, whole message at once) and the received messages (consume_task,
+// one pair per run, D20).
+
+// Planar parents of target box (tbx, tby) and source box (sbx, sby) adjacent.
+fn m2l_planar(tbx: u16, tby: u16, sbx: u16, sby: u16) bool {
+    const dpx : i16 = @as(i16, tbx >> 1) - @as(i16, sbx >> 1);
+    const dpy : i16 = @as(i16, tby >> 1) - @as(i16, sby >> 1);
+    return dpx >= -1 and dpx <= 1 and dpy >= -1 and dpy <= 1;
+}
+
+// Pair (source box z = src_z, target local node tn) at `level`, plane offset
+// (dxp, dyp) = target - source, mxy = max(|dxp|, |dyp|): translate if it is in
+// the interaction list. Returns true when it translated (the caller counts it in
+// pass_stats[4]).
+fn m2l_pair(level: u16, dxp: i16, dyp: i16, mxy: i16, src_z: u16, tn: u16,
+            src_exp: [*]f32) bool {
+    const tz : u16 = level_zbase(level) + tn;
+    const dz : i16 = @as(i16, tz) - @as(i16, src_z);
+    const dpz : i16 = @as(i16, tz >> 1) - @as(i16, src_z >> 1);
+    if (dpz < -1 or dpz > 1) return false;              // parents not adjacent
+    const adz : i16 = if (dz < 0) -dz else dz;
+    const mx : i16 = if (adz > mxy) adz else mxy;
+    if (mx < 2) return false;                           // adjacent: near field
+
+    const l_target = l_level_ptr(level);
+    var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
+    geom.get_physical_distances(dxp, dyp, dz, cons.box_size_at_level(level),
+                                &dist_x, &dist_y, &dist_z);
+    kernels.compute_irregular_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
+    kernels.translate(
+        @ptrcast([*]f32, &v_buf_m2l[0]),
+        src_exp,
+        @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]),
+        @ptrcast([*]u16, &m2l_offsets[0]),
+        @ptrcast([*]u16, &m2l_source_indices[0]),
+        @ptrcast([*]u16, &m2l_v_indices[0]),
+        @ptrcast([*]u32, &m2l_signs[0]));
+    return true;
+}
+
+fn abs_i16(v: i16) i16 { return if (v < 0) -v else v; }
+
+// Every pair of one message at once (local work of the pass).
 fn apply_m2l(level: u16, tbx: u16, tby: u16, sbx: u16, sby: u16,
              zbase: u16, zcount: u16, payload: [*]f32) void {
-    // Planar parent adjacency, decided once for the whole message.
-    const tpx : i16 = @as(i16, tbx >> 1); const spx : i16 = @as(i16, sbx >> 1);
-    const tpy : i16 = @as(i16, tby >> 1); const spy : i16 = @as(i16, sby >> 1);
-    const dpx : i16 = tpx - spx; const dpy : i16 = tpy - spy;
-    if (dpx < -1 or dpx > 1 or dpy < -1 or dpy > 1) return;
-
+    if (!m2l_planar(tbx, tby, sbx, sby)) return;
     const dxp : i16 = @as(i16, tbx) - @as(i16, sbx);
     const dyp : i16 = @as(i16, tby) - @as(i16, sby);
-    const adx : i16 = if (dxp < 0) -dxp else dxp;
-    const ady : i16 = if (dyp < 0) -dyp else dyp;
-    const mxy : i16 = if (adx > ady) adx else ady;
-
-    const tz0 : u16 = level_zbase(level);
+    const mxy : i16 = if (abs_i16(dxp) > abs_i16(dyp)) abs_i16(dxp) else abs_i16(dyp);
     const ntz : u16 = level_nodes(level);
-    const l_target = l_level_ptr(level);
-    const b_size : f32 = cons.box_size_at_level(level);
-
     for (@range(u16, zcount)) |ci| {
-        const src_z : u16 = zbase + ci;
         const src_exp : [*]f32 = @ptrcast([*]f32, &payload[ci * cons.C_BUF_SIZE]);
         for (@range(u16, ntz)) |tn| {
-            const tz : u16 = tz0 + tn;
-            const dz : i16 = @as(i16, tz) - @as(i16, src_z);
-            const dpz : i16 = @as(i16, tz >> 1) - @as(i16, src_z >> 1);
-            if (dpz < -1 or dpz > 1) continue;            // parents not adjacent
-            const adz : i16 = if (dz < 0) -dz else dz;
-            const mx : i16 = if (adz > mxy) adz else mxy;
-            if (mx < 2) continue;                           // adjacent: near field
-
-            var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
-            geom.get_physical_distances(dxp, dyp, dz, b_size, &dist_x, &dist_y, &dist_z);
-            kernels.compute_irregular_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
-            kernels.translate(
-                @ptrcast([*]f32, &v_buf_m2l[0]),
-                src_exp,
-                @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]),
-                @ptrcast([*]u16, &m2l_offsets[0]),
-                @ptrcast([*]u16, &m2l_source_indices[0]),
-                @ptrcast([*]u16, &m2l_v_indices[0]),
-                @ptrcast([*]u32, &m2l_signs[0]));
-            pass_stats[4] += 1;     // applied translations (diagnostic)
+            if (m2l_pair(level, dxp, dyp, mxy, zbase + ci, tn, src_exp)) pass_stats[4] += 1;
         }
     }
 }
@@ -375,7 +389,9 @@ fn store_boxes(dst: [*]f32, nbase: u16, zcount: u16, payload: [*]f32, add: bool)
     }
 }
 
-// Consume one message of the current pass (header already read).
+// Consume one M2M, L2L or P2P message of the current pass (header already
+// read). M2L messages go through the consume queue (m2l_queue); one it does
+// not take (not for this PE) is released with nothing to do.
 fn pass_consume(header: u32, payload: [*]f32) void {
     const sx = hdr_src_x(header);
     const sy = hdr_src_y(header);
@@ -391,10 +407,6 @@ fn pass_consume(header: u32, payload: [*]f32) void {
             const m = m_level_ptr(lv);
             store_boxes(@ptrcast([*]f32, &m.*[0]), zb - level_zbase(lv), zc, payload, true);
         }
-    } else if (cur_kind == KIND_M2L) {
-        if (geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv)) {
-            apply_m2l(lv, pe_x >> sh, pe_y >> sh, sx >> sh, sy >> sh, zb, zc, payload);
-        }
     } else if (cur_kind == KIND_L2L) {
         // a PE holding level lv+1 boxes copies the l of level lv of the rep(lv)
         // column of its block (its own box or a staging slot)
@@ -403,7 +415,7 @@ fn pass_consume(header: u32, payload: [*]f32) void {
             const l = l_level_ptr(lv);
             store_boxes(@ptrcast([*]f32, &l.*[0]), zb - level_zbase(lv), zc, payload, false);
         }
-    } else {
+    } else if (cur_kind == KIND_P2P) {
         // P2P: own and plane-neighbour columns (the own column only from other
         // chunks: a PE does not receive its own messages)
         const adx : u16 = if (sx > pe_x) sx - pe_x else pe_x - sx;
@@ -415,6 +427,94 @@ fn pass_consume(header: u32, payload: [*]f32) void {
             }
         }
     }
+}
+
+// --- M2L consume in pieces (D20) ---------------------------------------------
+// A final M2L message is not applied in the rx task: its port goes into a FIFO
+// (at most 4 entries: one slot per port, held until released) and consume_task
+// applies ONE translation per run, then activates itself again. The core picks
+// active tasks round-robin by id, so relays, credits and sends run between two
+// pieces instead of waiting for a whole message. The slot is released (credit
+// back) after the message's last pair; a pass completes only with the queue
+// empty (transport_check_done).
+var cq = @zeros([4]u16);        // ports of the queued messages
+var cq_head : u16 = 0;
+var cq_n : u16 = 0;
+var cm_open : u16 = 0;          // 1 when the head message is set up
+// Head message: plane offset target - source, z run, next pair (ci, tn).
+var cm_dxp : i16 = 0;
+var cm_dyp : i16 = 0;
+var cm_mxy : i16 = 0;
+var cm_zb : u16 = 0;
+var cm_zc : u16 = 0;
+var cm_ci : u16 = 0;
+var cm_tn : u16 = 0;
+
+// Queue the final M2L message on port d (true), or false when it has nothing
+// for this PE (the caller releases it at once).
+fn m2l_queue(d: u16) bool {
+    const lv = pass_dlevel;
+    if (!(geom.pe_is_plane_node(pe_x, pe_y, lv) and level_held(lv))) return false;
+    var q : u16 = cq_head + cq_n;
+    if (q >= 4) q -= 4;
+    cq[q] = d;
+    cq_n += 1;
+    if (cq_n == 1) @activate(cons.consume_id);
+    return true;
+}
+
+// Set up the head message from its header.
+fn m2l_open() void {
+    const slot = xp.xp_slot(cq[cq_head]);
+    const h : u32 = slot[0];
+    const sh : u16 = cons.TREE_H - pass_dlevel;
+    const tbx : u16 = pe_x >> sh; const tby : u16 = pe_y >> sh;
+    const sbx : u16 = hdr_src_x(h) >> sh; const sby : u16 = hdr_src_y(h) >> sh;
+    cm_dxp = @as(i16, tbx) - @as(i16, sbx);
+    cm_dyp = @as(i16, tby) - @as(i16, sby);
+    cm_mxy = if (abs_i16(cm_dxp) > abs_i16(cm_dyp)) abs_i16(cm_dxp) else abs_i16(cm_dyp);
+    cm_zb = hdr_zbase(h);
+    cm_zc = if (m2l_planar(tbx, tby, sbx, sby)) hdr_zcount(h) else 0;
+    cm_ci = 0;
+    cm_tn = 0;
+    cm_open = 1;
+}
+
+// Advance the head message to its next translation and apply it; false when
+// it has no pair left.
+fn m2l_next() bool {
+    const ntz : u16 = level_nodes(pass_dlevel);
+    const slot = xp.xp_slot(cq[cq_head]);
+    const pl = @ptrcast([*]f32, &slot[2]);
+    while (cm_ci < cm_zc) {
+        const ci : u16 = cm_ci;
+        const tn : u16 = cm_tn;
+        cm_tn += 1;
+        if (cm_tn >= ntz) { cm_tn = 0; cm_ci += 1; }
+        if (m2l_pair(pass_dlevel, cm_dxp, cm_dyp, cm_mxy, cm_zb + ci, tn,
+                     @ptrcast([*]f32, &pl[ci * cons.C_BUF_SIZE]))) {
+            pass_stats[4] += 1;     // applied translations (diagnostic)
+            return true;
+        }
+    }
+    return false;
+}
+
+task consume_task() void {
+    if (cq_n == 0) return;
+    if (cm_open == 0) m2l_open();
+    if (!m2l_next()) {
+        // message done: free its slot (the credit goes back)
+        const d : u16 = cq[cq_head];
+        cm_open = 0;
+        cq_head += 1;
+        if (cq_head == 4) cq_head = 0;
+        cq_n -= 1;
+        xp.xp_release(d);
+        send_all();
+    }
+    if (cq_n > 0) @activate(cons.consume_id);
+    transport_check_done();
 }
 
 // Prepare pass `pass`: reset the pass state, then arm the transport. Called
@@ -514,7 +614,8 @@ fn pass_complete() void {
 // cells); the payload is read IN PLACE from the pass data (no copy).
 // Two send engines (E+N, W+S), one message in flight each: owed credits, then
 // relays, then own messages, each only with a credit. A final message is
-// consumed in the rx task, then its slot is released (credit back).
+// consumed in the rx task (M2L: queued and applied in pieces by consume_task,
+// D20), then its slot is released (credit back).
 // Deadlock-free without any barrier but the per-pass host launch: waits point
 // along the direction of travel, and an engine starts a send only when it
 // holds the credit (checked by an event-level model and a transport testbench). When a pass
@@ -634,7 +735,7 @@ fn transport_start() void {
 
 fn transport_check_done() void {
     if (pass_done == 1 or pass_started == 0) return;
-    if (tr_rx != tr_n_rx) return;
+    if (tr_rx != tr_n_rx or cq_n != 0) return;
     for (@range(u16, 4)) |o| {
         if (tr_got[o] != tr_arr[o] or out_e[o] < out_ne[o]) return;
     }
@@ -657,9 +758,13 @@ fn on_rx(d: u16) void {
         tr_rx += 1;
         pass_stats[0] += 1;
         if (tr_rx > tr_n_rx) pass_stats[7] += 1;
-        const b = xp.xp_slot(d);
-        pass_consume(b[0], @ptrcast([*]f32, &b[2]));
-        xp.xp_release(d);
+        var queued : bool = false;
+        if (cur_kind == KIND_M2L) queued = m2l_queue(d);
+        if (!queued) {
+            const b = xp.xp_slot(d);
+            pass_consume(b[0], @ptrcast([*]f32, &b[2]));
+            xp.xp_release(d);
+        }
     }
     send_all();                                // a relay, a credit owed or received
     transport_check_done();
@@ -1176,6 +1281,7 @@ comptime {
     @bind_local_task(lane_n_tx_task, cons.lane_n_tx_id);
     @bind_local_task(lane_s_rx_task, cons.lane_s_rx_id);
     @bind_local_task(lane_s_tx_task, cons.lane_s_tx_id);
+    @bind_local_task(consume_task, cons.consume_id);
 
     @export_symbol(ptr_bodies_col, "ptr_bodies_col");
     @export_symbol(ptr_forces_col, "ptr_forces_col");
