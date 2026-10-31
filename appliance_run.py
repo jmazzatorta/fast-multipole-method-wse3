@@ -20,7 +20,7 @@ Flow:
      After the run the per-PE counters of every pass are checked against the
      transport tables (messages received / sent, relays, port arrivals) and the expected work; the leaf
      local buffer l_leaf is checked against fmm_ref after the leaf M2L pass
-     (M2L{H}) and after the last L2L pass (L2L{H-1}{H}).
+     (M2L{H}) and after the last L2L pass (L2L{H-1}{H}), unless --no-leaf-check.
   7. Pull forces_col, reassemble, compare to the direct N-body sum.
 
 Usage:
@@ -469,6 +469,7 @@ def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe, sample
         binned = fmm_ref.bin_bodies(bodies, max_bodies=max_bodies_pe)
         for k, name in checkpoint_passes().items():
             if k not in leaf_checkpoints:
+                print(f"  l_leaf after {name}: not read back, check skipped")
                 continue
             leaf = assemble_leaf(leaf_checkpoints[k], C)
             if name.startswith("M2L"):
@@ -565,6 +566,12 @@ def main():
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--phase-timeout", type=float, default=60.0,
                         help="seconds to wait for fmm_done after each phase")
+    parser.add_argument("--poll-max", type=float, default=0.5,
+                        help="longest sleep between two fmm_done reads (the "
+                             "sleep starts at 2 ms and doubles)")
+    parser.add_argument("--poll-delay", type=float, default=0.0,
+                        help="sleep before the first fmm_done read of every step "
+                             "(experiment: no host reads while a pass runs)")
     parser.add_argument("--nsteps", type=int, default=None,
                         help="run only the first N steps of the sequence "
                              "(default: all NPASS + 2)")
@@ -578,6 +585,15 @@ def main():
                         help="target bodies of the direct-sum physics checks, drawn "
                              "with a fixed seed (0 = all bodies; the cost is "
                              "O(sample * N))")
+    parser.add_argument("--send-order", default="gen",
+                        help="order of each PE's sends (zmp_tables.SEND_ORDERS; "
+                             "hardware experiment, default gen)")
+    parser.add_argument("--no-leaf-check", action="store_true",
+                        help="do not read l_leaf back after the leaf M2L and the "
+                             "last L2L pass: these reads stop the device between "
+                             "two launches (~7.5 s at 128^3 P4) and their reference "
+                             "checks dominate the host time; counts, forces and "
+                             "the TSC log are still checked")
     parser.add_argument("--verify-only", default=None, metavar="RUN_DIR",
                         help="re-run the verification on RUN_DIR/device_data.npz "
                              "(no device needed)")
@@ -615,6 +631,8 @@ def main():
     blk_lbw = int(compile_data["params"]["blk_lbw"])
     configure_order(C, P, zp, blk_lbw)
     import zmp_tables
+    zmp_tables.set_send_order(args.send_order)
+    print(f"send order: {args.send_order}")
     pmap = zmp_tables.MAP
     assert pmap.lbh == int(compile_data["params"]["blk_lbh"])
     max_bodies_pe = int(compile_data["params"]["max_bodies_pe"])
@@ -793,8 +811,13 @@ def main():
                 # Poll the completion flag: each PE writes the phase id into
                 # fmm_done on TRUE completion (a phase unblocks the host before
                 # it is done, so the launch return alone proves nothing).
+                # Adaptive interval: the first read after --poll-delay (default
+                # at once), then sleep 2 ms doubling up to --poll-max (a fixed
+                # 0.5 s cost ~0.5 s on every step longer than one read).
                 t1 = time.time()
                 done = np.zeros(total_pe, dtype=np.uint32)
+                time.sleep(args.poll_delay)
+                nap = 0.002
                 while True:
                     runner.memcpy_d2h(done, sym["fmm_done"], 0, 0, rect[0], rect[1], 1,
                                       streaming=False,
@@ -803,7 +826,8 @@ def main():
                     ndone = int((done >= pid).sum())
                     if ndone == total_pe or time.time() - t1 > args.phase_timeout:
                         break
-                    time.sleep(0.5)
+                    time.sleep(nap)
+                    nap = min(2 * nap, args.poll_max)
                 print(f"        fmm_done = {ndone}/{total_pe} PEs  "
                       f"(waited {time.time()-t1:.3f} s)", flush=True)
                 if ndone != total_pe:
@@ -831,7 +855,7 @@ def main():
                 completed.append(pid)
                 if phase == "run_pass":
                     k = pid - 2
-                    if k in checkpoint_passes():
+                    if not args.no_leaf_check and k in checkpoint_passes():
                         leaf_checkpoints[k] = d2h_per_pe_f32(
                             runner, sym["l_leaf"], rect, zp * fmm_ref.C_BUF_SIZE)
 
@@ -872,6 +896,7 @@ def main():
         # offline: python appliance_run.py --verify-only runs/<label>_runNN
         np.savez(os.path.join(run_dir, "device_data.npz"), bodies=bodies,
                  C=C, order_p=P, zp=zp, blk_lbw=blk_lbw, max_bodies_pe=max_bodies_pe,
+                 send_order=args.send_order,
                  **{f"stats_{k}": v for k, v in pass_stats.items()},
                  **{f"leaf_{k}": v for k, v in leaf_checkpoints.items()},
                  **({"forces": forces_3d} if forces_3d is not None and STEP_L2P in completed else {}),
