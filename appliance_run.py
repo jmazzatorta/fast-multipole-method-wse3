@@ -601,6 +601,9 @@ def main():
                         help="target bodies of the direct-sum physics checks, drawn "
                              "with a fixed seed (0 = all bodies; the cost is "
                              "O(sample * N))")
+    parser.add_argument("--one-launch", action="store_true",
+                        help="one launch, the device barrier chains the steps; needs "
+                             "--no-leaf-check (the leaf checks read between steps)")
     parser.add_argument("--no-leaf-check", action="store_true",
                         help="do not read l_leaf back after the leaf M2L and the "
                              "last L2L pass: these reads stop the device between "
@@ -611,6 +614,10 @@ def main():
                         help="re-run the verification on RUN_DIR/device_data.npz "
                              "(no device needed)")
     args = parser.parse_args()
+    if args.one_launch and not args.no_leaf_check:
+        parser.error("--one-launch needs --no-leaf-check")
+    if args.one_launch and args.nsteps is not None:
+        parser.error("--one-launch runs every step: no --nsteps")
     global MEMCPY_MAX_BYTES
     MEMCPY_MAX_BYTES = args.memcpy_max_kib << 10
     if args.verify_only:
@@ -815,8 +822,49 @@ def main():
             print(f"[probe] pre-launch d2h OK in {time.time()-tp:.3f} s  "
                   f"(sum={int(pre.sum())}, expect 0)", flush=True)
 
-            print("[4/4] Launching FMM phases (host-barriered)...")
-            for pid, phase, label in STEPS:
+            if args.one_launch:
+                print("[4/4] One launch, device barrier...")
+                t1 = time.time()
+                limit = args.phase_timeout * len(STEPS)
+                runner.launch("run_all", nonblock=False)
+                # Fabric (0,0) first: one word, not one per PE.
+                one = np.zeros(1, dtype=np.uint32)
+                nap = 0.002
+                while time.time() - t1 <= limit:
+                    runner.memcpy_d2h(one, sym["fmm_done"], 0, 0, 1, 1, 1, streaming=False,
+                                      data_type=MemcpyDataType.MEMCPY_32BIT,
+                                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+                    if int(one[0]) >= STEP_L2P:
+                        break
+                    time.sleep(nap)
+                    nap = min(2 * nap, args.poll_max)
+                print(f"      (0,0) at step {int(one[0])} after {time.time()-t1:.3f} s", flush=True)
+                done = np.zeros(total_pe, dtype=np.uint32)
+                while True:
+                    runner.memcpy_d2h(done, sym["fmm_done"], 0, 0, rect[0], rect[1], 1,
+                                      streaming=False,
+                                      data_type=MemcpyDataType.MEMCPY_32BIT,
+                                      nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+                    if int(done.min()) >= STEP_L2P or time.time() - t1 > limit:
+                        break
+                    time.sleep(args.poll_max)
+                lowest = int(done.min())
+                completed.extend(pid for pid, _, _ in STEPS if pid <= lowest)
+                print(f"      fmm_done minimum {lowest}, last step {STEP_L2P}", flush=True)
+                if lowest < STEP_L2P:
+                    err = f"step {lowest + 1} incomplete"
+                    print(f"        stopping: {err}", flush=True)
+                    k = lowest - 1
+                    if 0 <= k < fmm_passes.NPASS:
+                        live = d2h_per_pe_u32(runner, sym["pass_stats"], rect, 8)
+                        allst = d2h_per_pe_u32(runner, sym["pass_stats_all"], rect,
+                                               fmm_passes.NPASS * 8)
+                        fin = (done > lowest).reshape(rect[1], rect[0])
+                        pass_stats[k] = np.where(fin[:, :, None],
+                                                 allst[:, :, k * 8:(k + 1) * 8], live)
+                        stuck_done = done.reshape(rect[1], rect[0]).copy()
+
+            for pid, phase, label in ([] if args.one_launch else STEPS):
                 t0 = time.time()
                 runner.launch(phase, nonblock=False)
                 dt = time.time() - t0

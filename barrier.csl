@@ -1,0 +1,146 @@
+// barrier.csl - device barrier (compare/analysis/architecture.md section 3.3, testbench/barrier/).
+// Reduce to fabric (0,0) along the rows, then along column 0, one wavelet per link; (0,0) then
+// broadcasts by routes, down column 1 and along the rows. WSE-3 allows one input direction per
+// color and only queues 6 and 7 are free, so column 0, which already holds a row child and a
+// column child, gets its release from its east neighbour: same link and queue as that
+// neighbour's reduce wavelet, told apart by the value.
+//
+// Resources: colors 11..15, input and output queues 6, 7, local task 23. Sends use microthreads
+// 6 and 7, the transport's engines, idle at the end of a pass since completion means every send
+// is done. A send that precedes a pass start activates the release when it is done, so the pass
+// cannot start an engine still in use. Data tasks hold no microthread while waiting and may
+// fire before the PE has entered: arrivals are counted.
+//
+// Accepted risk: the release forwarded by column 1 does not check that engine A is idle. A relay
+// could start first only if a message from the PE above beats this PE's own copy of the broadcast,
+// which leaves over the sender's whole task chain earlier; no timing that does it was found.
+
+param x_role : u16;     // 0 column 0, 1 column 1, 2 other, 3 last column
+param y_role : u16;     // 0 row 0, 1 other, 2 last row
+param parity : u16;     // of the fabric column
+param parity_y : u16;   // of the fabric row
+param release_id : local_task_id;   // activated once per barrier
+
+const C_A = @get_color(11);
+const C_B = @get_color(12);
+const C_BC = @get_color(13);
+const C_C = @get_color(14);
+const C_D = @get_color(15);
+const row_recv = if (parity == 0) C_A else C_B;
+const row_send = if (parity == 0) C_B else C_A;
+const col_recv = if (parity_y == 0) C_C else C_D;
+const col_send = if (parity_y == 0) C_D else C_C;
+const iq_row = @get_input_queue(6);
+const iq_7 = @get_input_queue(7);       // column child in column 0, broadcast elsewhere
+const oq_up = @get_output_queue(6);
+const oq_bc = @get_output_queue(7);
+const UT_UP = @get_ut_id(6);
+const UT_BC = @get_ut_id(7);
+const sent_id : local_task_id = @get_local_task_id(23);
+
+const WAVE_REDUCE : u32 = 1;
+const WAVE_RELEASE : u32 = 2;
+const is_root = x_role == 0 and y_role == 0;
+const n_child : u16 = (if (x_role != 3) @as(u16, 1) else @as(u16, 0))
+                    + (if (x_role == 0 and y_role != 2) @as(u16, 1) else @as(u16, 0));
+
+var wave_reduce : [1]u32 = [1]u32 { WAVE_REDUCE };
+var wave_release : [1]u32 = [1]u32 { WAVE_RELEASE };
+var rx_count : u16 = 0;
+var entered : bool = false;
+
+const reduce_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> wave_reduce[i] });
+const release_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> wave_release[i] });
+const up_dsd = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = oq_up });
+const bc_dsd = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = oq_bc });
+
+fn check_up() void {
+    if (entered and rx_count >= n_child) {
+        rx_count = rx_count - n_child;
+        entered = false;
+        if (is_root) {
+            @mov32(bc_dsd, reduce_dsd, .{ .async = true, .ut_id = UT_BC, .activate = sent_id });
+        } else {
+            @mov32(up_dsd, reduce_dsd, .{ .async = true, .ut_id = UT_UP });
+        }
+    }
+}
+
+// This PE's work of the step is done.
+fn bar_enter() void {
+    entered = true;
+    check_up();
+}
+
+task bar_sent() void {
+    @activate(release_id);
+}
+
+// Row child. In column 0 the same queue also brings the release.
+task rx_row(w : u32) void {
+    if (w == WAVE_RELEASE) {
+        @activate(release_id);
+    } else {
+        rx_count = rx_count + 1;
+        check_up();
+    }
+}
+
+task rx_column(w : u32) void {
+    rx_count = rx_count + 1;
+    check_up();
+}
+
+task rx_bcast(w : u32) void {
+    if (x_role == 1 and y_role != 0) {
+        @mov32(up_dsd, release_dsd, .{ .async = true, .ut_id = UT_UP, .activate = sent_id });
+    } else {
+        @activate(release_id);
+    }
+}
+
+comptime {
+    @bind_local_task(bar_sent, sent_id);
+    @bind_data_task(rx_row, @get_data_task_id(iq_row));
+    @initialize_queue(iq_row, .{ .color = row_recv });
+    if (x_role == 0) {
+        @bind_data_task(rx_column, @get_data_task_id(iq_7));
+        @initialize_queue(iq_7, .{ .color = col_recv });
+        @initialize_queue(oq_up, .{ .color = col_send });
+    } else {
+        @bind_data_task(rx_bcast, @get_data_task_id(iq_7));
+        @initialize_queue(iq_7, .{ .color = C_BC });
+        @initialize_queue(oq_up, .{ .color = row_send });
+    }
+    @initialize_queue(oq_bc, .{ .color = C_BC });
+
+    if (x_role != 3) {
+        @set_local_color_config(row_recv, .{ .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } } });
+    }
+    if (x_role != 0) {
+        @set_local_color_config(row_send, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } } });
+    } else {
+        if (y_role != 2) {
+            @set_local_color_config(col_recv, .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+        }
+        if (y_role != 0) {
+            @set_local_color_config(col_send, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH } } });
+        }
+    }
+
+    if (is_root) {
+        @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+    } else if (x_role == 1) {
+        if (y_role == 0) {
+            @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ SOUTH, EAST, RAMP } } });
+        } else if (y_role == 1) {
+            @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ SOUTH, EAST, RAMP } } });
+        } else {
+            @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ EAST, RAMP } } });
+        }
+    } else if (x_role == 2) {
+        @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ EAST, RAMP } } });
+    } else if (x_role == 3) {
+        @set_local_color_config(C_BC, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+    }
+}

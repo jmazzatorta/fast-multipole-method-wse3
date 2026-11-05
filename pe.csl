@@ -34,6 +34,8 @@
 // memcpy params struct from the layout. Declared untyped: the `comptime_struct`
 // type annotation is not accepted by the current cslc (server 1.20.2).
 param memcpy_params;
+param bar_x_role : u16;     // barrier.csl
+param bar_y_role : u16;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 
 // --- GLOBAL PARAMETERS (from layout) ---
@@ -90,6 +92,14 @@ const kernels = @import_module("kernels.csl", .{
 });
 const time_mod = @import_module("<time>");
 const tc = @import_module("<tile_config>");
+const chain_id : local_task_id = @get_local_task_id(25);
+const bar = @import_module("barrier.csl", .{
+    .x_role = bar_x_role,
+    .y_role = bar_y_role,
+    .parity = parity,
+    .parity_y = parity_y,
+    .release_id = chain_id,
+});
 const xp = @import_module("xport.csl", .{
     .px = parity, .py = parity_y, .max_len = cons.MSG_PAYLOAD_MAX,
     .e_rx_id = cons.lane_e_rx_id, .e_tx_id = cons.lane_e_tx_id,
@@ -1636,13 +1646,19 @@ fn tsc_mark(step: u16, marker: u16) void {
 // Host sequence and step ids:
 //   run_p2m (1) -> run_pass x NPASS (2 .. NPASS+1, see PASSES) -> run_l2p
 //   (NPASS+2). C = 16: 8 passes, run_l2p = 10.
+// Or run_all, one launch: the device barrier (barrier.csl) ends every step and
+// its release starts the next, the same guarantee as the host's. The host cannot
+// read state between steps then, so the leaf checks need the sequence above.
 const STEP_P2M : u32 = 1;
 const STEP_PASS0 : u32 = 2;
 const STEP_L2P : u32 = 2 + @as(u32, NPASS);   // 10 at C=16
 
+var one_launch : bool = false;
+
 fn phase_signal_done(step: u32) void {
     tsc_mark(@as(u16, step) - 1, 2);
     fmm_done[0] = step;
+    if (one_launch and step < STEP_L2P) bar.bar_enter();
 }
 
 // Position from the fabric coordinates (absolute, = rectangle offset +
@@ -1686,7 +1702,7 @@ fn clear_level_buffers() void {
 // P2M, then the local start of the upward pass: every PE translates its leaf
 // multipoles into its level H-1 partials about the parent centres (summed at
 // the parents' owners by the first M2M pass).
-export fn run_p2m() void {
+fn p2m_step() void {
     time_mod.enable_tsc();       // resets this PE's counter: once per run
     kernels.m2l_init();
     tsc_mark(0, 0);
@@ -1702,17 +1718,25 @@ export fn run_p2m() void {
     m2m_z_local(cons.TREE_H);
     pass_prepare(0);
     phase_signal_done(STEP_P2M);
+}
+
+export fn run_p2m() void {
+    p2m_step();
     sys_mod.unblock_cmd_stream();
+}
+
+fn pass_step() void {
+    tsc_mark(1 + cur_pass, 0);
+    pass_begin();
 }
 
 // Launch the prepared pass (the host calls this once per pass).
 export fn run_pass() void {
-    tsc_mark(1 + cur_pass, 0);
-    pass_begin();
+    pass_step();
     sys_mod.unblock_cmd_stream();
 }
 
-export fn run_l2p() void {
+fn l2p_step() void {
     // Evaluate the leaf local expansion at each body; accumulate far-field force
     // (forces_col already holds the near field of pass P2P).
     tsc_mark(TSC_NSTEP - 1, 0);
@@ -1744,6 +1768,25 @@ export fn run_l2p() void {
         n += 1;
     }
     phase_signal_done(STEP_L2P);
+}
+
+export fn run_l2p() void {
+    l2p_step();
+    sys_mod.unblock_cmd_stream();
+}
+
+// Barrier released: the next step.
+task chain_step() void {
+    if (fmm_done[0] < STEP_L2P - 1) {
+        pass_step();
+    } else {
+        l2p_step();
+    }
+}
+
+export fn run_all() void {
+    one_launch = true;
+    p2m_step();
     sys_mod.unblock_cmd_stream();
 }
 
@@ -1807,6 +1850,8 @@ comptime {
     @export_symbol(run_p2m, "run_p2m");
     @export_symbol(run_pass, "run_pass");
     @export_symbol(run_l2p, "run_l2p");
+    @export_symbol(run_all, "run_all");
+    @bind_local_task(chain_step, chain_id);
 
     @export_symbol(ptr_m2m_offsets, "ptr_m2m_offsets");
     @export_symbol(ptr_m2m_child_indices, "ptr_m2m_child_indices");
