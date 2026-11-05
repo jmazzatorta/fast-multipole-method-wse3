@@ -21,6 +21,7 @@ with 8 cells per PE = 64 x 64 PEs):
     python3 appliance_compile.py 32 4 --label C32_MB4
     python3 appliance_compile.py 16 8 --P 5 --label C16_MB8_P5
     python3 appliance_compile.py 32 4 --zp 8 --label C32_MB4_Z8
+    python3 appliance_compile.py 16 8 --sweep-lmin 4 --label C16_MB8_SW
 
 Output (in ./compiled/<LABEL>/):
     artifact_path.json, cs_<hash>.tar.gz, out/, compile.log, compile_meta.json
@@ -77,6 +78,9 @@ def main():
     parser.add_argument("--zp", type=int, default=None,
                         help="leaf cells per PE along z, a power of two dividing C "
                              "(default C: one PE per column)")
+    parser.add_argument("--sweep-lmin", type=int, default=None,
+                        help="M2L levels L >= this are swept (pe.csl SWEEP M2L); "
+                             "default: none")
     parser.add_argument("--label", required=True,
                         help="Config label (e.g. C16_MB8). Output -> ./compiled/<label>/.")
     parser.add_argument("--aliases", default="")
@@ -129,7 +133,7 @@ def main():
     import fmm_passes
     import fmm_tables
     import zmp_tables
-    zmp_tables.configure(C, args.P, zp, args.block_lbw)
+    zmp_tables.configure(C, args.P, zp, args.block_lbw, args.sweep_lmin)
     fmm_tables.set_order(args.P)
     tsz = fmm_tables.table_sizes()
     mp_ent_cap = zmp_tables.stats(args.max_bodies_pe)[1]
@@ -145,6 +149,7 @@ def main():
         f"--params=m2m_n_entries:{tsz['m2m']} "
         f"--params=l2l_n_entries:{tsz['l2l']} "
         f"--params=mp_ent_cap:{mp_ent_cap} "
+        f"--params=sweep_lmin:{zmp_tables.SWEEP_LMIN} "
         f"--params=zp_log:{pmap.lzp} "
         f"--params=blk_lbw:{pmap.lbw} "
         f"--params=blk_lbh:{pmap.lbh} "
@@ -182,6 +187,7 @@ def main():
     print(f"  passes        : {fmm_passes.NPASS}  "
           f"({' '.join(p[0] for p in fmm_passes.PASSES)})")
     print(f"  mp_ent_cap    : {mp_ent_cap}")
+    print(f"  sweep_lmin    : {zmp_tables.SWEEP_LMIN}  (tree height + 1 = none)")
     print(f"  cslc opts     : {cslc_opts}")
     print(f"  Out dir       : {out_dir}")
     print()
@@ -250,6 +256,7 @@ def main():
             "block_lbw": pmap.lbw,
             "offsets": args.offsets,
             "mp_ent_cap": mp_ent_cap,
+            "sweep_lmin": zmp_tables.SWEEP_LMIN,
             "total_pe": total_pe,
         },
         "cslc_options": cslc_opts,

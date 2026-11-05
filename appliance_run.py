@@ -434,8 +434,10 @@ def expected_transport(k, max_bodies_pe):
     """(H, W, 4) expected pass_stats[0..3] of pass k (pe.csl TRANSPORT, all-
     static transport): messages consumed (slot 0), relays = straight forwards + turns
     (slot 1), own messages sent (slot 2), port arrivals incl. credits, E + W +
-    N + S (slot 3); from zmp_tables."""
+    N + S (slot 3); from zmp_tables. A swept pass: pe.csl SWEEP M2L counters."""
     import zmp_tables as Z
+    if Z.swept(k):
+        return Z.sweep_expected(k), ["stops", "sends-h", "sends-v", "recv"]
     n_rx, n_tx = Z.pass_counts(k, max_bodies_pe)
     lc = Z.lane_counts(k, max_bodies_pe)
     exp = np.zeros((Z.MAP.height, Z.MAP.width, 4), dtype=np.int64)
@@ -468,9 +470,13 @@ def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe, sample
         nwork = int((st[:, :, 4] != wexp).sum())
         ok = not bad and ndone == npe and stray == 0 and perr == 0 and nwork == 0
         allok &= ok
-        print(f"  pass {k} {T.PASSES[k][0]:6s}: done {ndone}/{npe}  arrivals "
-              f"{int(st[:, :, 0].sum()):6d}/{int(exp[:, :, 0].sum()):6d}  relays "
-              f"{int(st[:, :, 1].sum()):6d}/{int(exp[:, :, 1].sum()):6d}  work "
+        if names[0] == "stops":
+            counts = "  ".join(f"{names[i]} {int(st[:, :, i].sum())}/{int(exp[:, :, i].sum())}"
+                               for i in range(4))
+        else:
+            counts = (f"arrivals {int(st[:, :, 0].sum()):6d}/{int(exp[:, :, 0].sum()):6d}  relays "
+                      f"{int(st[:, :, 1].sum()):6d}/{int(exp[:, :, 1].sum()):6d}")
+        print(f"  pass {k} {T.PASSES[k][0]:6s}: done {ndone}/{npe}  {counts}  work "
               f"{int(st[:, :, 4].sum()):6d}/{int(wexp.sum()):6d}  stray {stray}  "
               f"proto-err {perr}  {'OK' if ok else 'FAIL ' + ', '.join(bad) + (f' work:{nwork} PEs' if nwork else '')}")
     try:
@@ -547,12 +553,13 @@ def print_tsc(tsc):
 # ===========================================================================
 # Main
 # ===========================================================================
-def configure_order(C, P, zp, lbw=None):
+def configure_order(C, P, zp, lbw=None, sweep_lmin=None):
     """Configure the host modules for mesh side C, expansion order P, ZP cells
-    per PE and block width 2**lbw (the values the program was compiled with)."""
+    per PE, block width 2**lbw and lowest swept M2L level (the values the program
+    was compiled with)."""
     import fmm_ref
     import zmp_tables
-    zmp_tables.configure(C, P, zp, lbw)  # also fmm_passes
+    zmp_tables.configure(C, P, zp, lbw, sweep_lmin)  # also fmm_passes
     fmm_ref.set_order(P)          # also sets fmm_tables' order
     fmm_ref.set_mesh(C)
 
@@ -611,7 +618,8 @@ def main():
         # runs saved before GEN have no order_p (P = 4), before G no zp (ZP = C)
         configure_order(int(d["C"]), int(d["order_p"]) if "order_p" in d.files else 4,
                         int(d["zp"]) if "zp" in d.files else int(d["C"]),
-                        int(d["blk_lbw"]) if "blk_lbw" in d.files else None)
+                        int(d["blk_lbw"]) if "blk_lbw" in d.files else None,
+                        int(d["sweep_lmin"]) if "sweep_lmin" in d.files else None)
         ps = {int(k[6:]): d[k] for k in d.files if k.startswith("stats_")}
         # leaf_<k>: l_leaf after pass k (l4_<k> in runs saved before GEN)
         cp = {int(k.split("_")[1]): d[k] for k in d.files
@@ -635,8 +643,11 @@ def main():
     P = int(compile_data["params"]["order_p"])
     zp = 1 << int(compile_data["params"]["zp_log"])
     blk_lbw = int(compile_data["params"]["blk_lbw"])
-    configure_order(C, P, zp, blk_lbw)
+    # An artifact from before the sweep has no sweep_lmin: nothing swept.
+    sweep_lmin = compile_data["params"].get("sweep_lmin")
+    configure_order(C, P, zp, blk_lbw, None if sweep_lmin is None else int(sweep_lmin))
     import zmp_tables
+    sweep_lmin = zmp_tables.SWEEP_LMIN
     pmap = zmp_tables.MAP
     assert pmap.lbh == int(compile_data["params"]["blk_lbh"])
     max_bodies_pe = int(compile_data["params"]["max_bodies_pe"])
@@ -714,6 +725,7 @@ def main():
     print(f"  PEs    : ZP {zp} cells per PE, {pmap.nk} per column (block {pmap.bw}x{pmap.bh}), "
           f"rectangle {rect[0]} x {rect[1]} = {total_pe} PE")
     print(f"  Order  : P = {P}")
+    print(f"  Sweep  : M2L levels >= {sweep_lmin} (tree height + 1 = none)")
     print(f"  max_bodies_pe : {max_bodies_pe}")
     print(f"  Bodies : {N}")
     print(f"  Steps  : {' -> '.join(lbl for _, _, lbl in STEPS)}")
@@ -896,7 +908,8 @@ def main():
         # Save what came off the device, so the verification can be re-run
         # offline: python appliance_run.py --verify-only runs/<label>_runNN
         np.savez(os.path.join(run_dir, "device_data.npz"), bodies=bodies,
-                 C=C, order_p=P, zp=zp, blk_lbw=blk_lbw, max_bodies_pe=max_bodies_pe,
+                 C=C, order_p=P, zp=zp, blk_lbw=blk_lbw, sweep_lmin=sweep_lmin,
+                 max_bodies_pe=max_bodies_pe,
                  **{f"stats_{k}": v for k, v in pass_stats.items()},
                  **{f"leaf_{k}": v for k, v in leaf_checkpoints.items()},
                  **({"forces": forces_3d} if forces_3d is not None and STEP_L2P in completed else {}),

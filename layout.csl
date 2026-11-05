@@ -31,6 +31,8 @@ param mp_ent_cap : u16;
 param zp_log : u16;
 param blk_lbw : u16;
 param blk_lbh : u16;
+// M2L levels L >= sweep_lmin are swept (pe.csl SWEEP M2L); tree_h + 1 = none.
+param sweep_lmin : u16;
 const cell_size : f32 = prob_range / @as(f32, cells_per_side);
 
 // --- Memcpy streaming colors (host <-> device) ---
@@ -77,6 +79,7 @@ layout {
                 .m2m_n_entries = m2m_n_entries,
                 .l2l_n_entries = l2l_n_entries,
                 .mp_ent_cap = mp_ent_cap,
+                .sweep_lmin = sweep_lmin,
                 .parity = fx & 1,
                 .parity_y = fy & 1,
                 .blk_lbw = blk_lbw,

@@ -35,8 +35,13 @@ The plane and z parts are separable: per column pair the z relation is one of
 a few 1D relations, tabulated per (sender chunk, receiver chunk). check() is
 an independent box-by-box (brute force) derivation for small meshes.
 
-    python3 zmp_tables.py [MB] [C] [P] [ZP] [--check] [--regress]
-      (default 4 32 4 8; --check: brute force, small meshes; --regress: GEN)
+M2L levels >= sweep_lmin are swept (pe.csl SWEEP M2L): no message and no table. The
+generator (sent, brute, check) keeps them; pass_entries, pass_counts, lane_counts,
+stats and device_tables see them as empty; sweep_expected gives their counters.
+
+    python3 zmp_tables.py [MB] [C] [P] [ZP] [--check] [--regress] [--lmin=L]
+      (default 4 32 4 8; --check: brute force, small meshes; --regress: GEN;
+       --lmin: sweep_lmin, default none)
 """
 import sys
 from itertools import product
@@ -52,18 +57,28 @@ ENT_W = 3
 ZP = 0
 MAP = None
 PES = []                # every PE, fabric (fx, fy), row-major
+SWEEP_LMIN = 0          # M2L levels >= this are swept; TREE_H + 1 = none
 
 
-def configure(c, p, zp, lbw=None):
+def configure(c, p, zp, lbw=None, sweep_lmin=None):
     """Mesh side c, order p, zp leaf cells per PE (power of two, zp | c);
-    lbw: log2 of the block width (pe_map.block_shape; default square-ish)."""
-    global ZP, MAP, PES
+    lbw: log2 of the block width (pe_map.block_shape; default square-ish);
+    sweep_lmin: lowest swept M2L level (default none)."""
+    global ZP, MAP, PES, SWEEP_LMIN
     S.configure(c, p)
     assert zp & (zp - 1) == 0 and 1 <= zp <= c
     ZP = zp
     MAP = PeMap(c, c, c, zp, lbw)
     PES = [(fx, fy) for fy in range(MAP.height) for fx in range(MAP.width)]
+    SWEEP_LMIN = S.TREE_H + 1 if sweep_lmin is None else sweep_lmin
+    # Every chunk of a holder column holds boxes on a swept level (pe.csl comptime).
+    assert 2 <= SWEEP_LMIN <= S.TREE_H + 1 and SWEEP_LMIN + MAP.lzp >= S.TREE_H, \
+        f"sweep_lmin {SWEEP_LMIN}: a swept level needs at least 1 box per PE"
     _CACHE.clear()
+
+
+def swept(pi):
+    return S.is_sweep(pi, SWEEP_LMIN)
 
 
 def height(level):
@@ -219,6 +234,8 @@ def runs(zs):
 
 def pass_entries(pi):
     """sender PE -> rotated list of entries (dest_fx, dest_fy, zbase, zcount)."""
+    if swept(pi):
+        return {}
     per = {}
     for (a, b), zs in sent(pi).items():
         for zb, zn in runs(zs):
@@ -351,6 +368,9 @@ def stats(max_bodies_pe):
     tot = np.zeros(shape, dtype=np.int64)
     out = []
     for pi in range(S.NPASS):
+        if swept(pi):
+            out.append((0, 0, 0, 0))
+            continue
         k = per_msg(pi, max_bodies_pe)
         ent = np.zeros(shape, dtype=np.int64)
         rx = np.zeros(shape, dtype=np.int64)
@@ -364,6 +384,139 @@ def stats(max_bodies_pe):
         tot += ent
         out.append((int(rx.sum()), int(rx.max()), int(ent.max()), int(tx.max())))
     return out, int(tot.max())
+
+
+# ---------------------------------------------------------------------------
+# Swept M2L: the program of a pass, common to all PEs, and its counters
+# ---------------------------------------------------------------------------
+STEP = ((1, 0), (-1, 0), (0, -1), (0, 1))     # E, W, N, S (fabric y grows south)
+
+
+def sweep_geometry(lv):
+    """(pieces, pitch x, pitch y) of the swept level lv."""
+    n = max(1, ZP >> (S.TREE_H - lv))
+    s = S.stride(lv)
+    ghosts = 0 if MAP.nk == 1 else 1 if n >= 2 else 2
+    return ((n + 3) >> 2) + ghosts, s * MAP.bw, s * MAP.bh
+
+
+def sweep_walk(lv):
+    """The ops of one walk (pe.csl sw_next_stop order), the same for every piece:
+    ("s", dx, dy) a stop; ("h", d, tx, ty) a hop in direction d with the moving
+    buffer at displacement (tx, ty) before it."""
+    _, px, py = sweep_geometry(lv)
+    ops = []
+
+    def edge(d, dx, dy):
+        p = py if d >= 2 else px
+        for h in range(p):
+            ops.append(("h", d, dx * px + STEP[d][0] * h, dy * py + STEP[d][1] * h))
+
+    def stop_column(dx):
+        ops.append(("s", dx, 0))
+        for sg, d in ((-1, 2), (1, 3)):
+            for a in range(1, 4):
+                edge(d, dx, sg * (a - 1))
+                ops.append(("s", dx, sg * a))
+
+    stop_column(0)
+    for sg, d in ((1, 0), (-1, 1)):
+        for a in range(1, 4):
+            edge(d, sg * (a - 1), 0)
+            stop_column(sg * a)
+    return ops
+
+
+def sweep_origin_ok(ox, oy, lv):
+    """Per PE (arrays or scalars) of origin (ox, oy) a holder: pe.csl sw_origin_ok
+    at level lv."""
+    m = S.stride(lv) - 1
+    return (ox >= 0) & (ox < MAP.width) & (oy >= 0) & (oy < MAP.height) \
+        & (((ox >> MAP.lbw) & m) == 0) & (((oy >> MAP.lbh) & m) == 0)
+
+
+def sweep_hop_parts(fx, fy, op, lv):
+    """Arrays fx, fy of PEs, a hop op at level lv: (does it send, does it receive),
+    per PE."""
+    _, d, tx, ty = op
+    ex, ey = STEP[d]
+    nx, ny = fx + ex, fy + ey
+    do_tx = sweep_origin_ok(fx - tx, fy - ty, lv) & (nx >= 0) & (nx < MAP.width) \
+        & (ny >= 0) & (ny < MAP.height)
+    return do_tx, sweep_origin_ok(fx - tx - ex, fy - ty - ey, lv)
+
+
+def sweep_z_ops(lv):
+    """The z stage of swept level lv: ("z", up, j, one) hop j of a direction; one: n = 1."""
+    if MAP.nk == 1:
+        return []
+    one = (ZP >> (S.TREE_H - lv)) == 1
+    return [("z", up, j, one) for up in (True, False) for j in (range(1, 4) if one else (1,))]
+
+
+def _snake_dir(a, b):
+    """Direction of travel from chunk a to the adjacent chunk b."""
+    (ax, ay), (bx, by) = MAP.k_to_kxy(a), MAP.k_to_kxy(b)
+    return 0 if bx > ax else 1 if bx < ax else 2 if by < ay else 3
+
+
+def sweep_z_parts(fx, fy, op):
+    """Arrays fx, fy of PEs, a z hop: (does it send, does it receive, direction of
+    the send, direction of travel of the receive), per PE (pe.csl sw_start_z). A
+    direction is meaningful only where that part exists."""
+    _, up, j, one = op
+    kx, ky = fx & (MAP.bw - 1), fy & (MAP.bh - 1)
+    k = (ky << MAP.lbw) | np.where(ky & 1, (MAP.bw - 1) - kx, kx)
+    sg = 1 if up else -1
+
+    def moves(ko):
+        ok = (ko >= 0) & (ko < MAP.nk)
+        return ok & (j <= np.where(((ko & 1) == 0) == up, 3, 2)) if one else ok
+
+    do_tx = moves(k - sg * (j - 1)) & (k + sg >= 0) & (k + sg < MAP.nk)
+    do_rx = moves(k - sg * j)
+    out_dir = np.array([_snake_dir(c, c + sg) if 0 <= c + sg < MAP.nk else 0 for c in range(MAP.nk)])
+    in_dir = np.array([_snake_dir(c - sg, c) if 0 <= c - sg < MAP.nk else 0 for c in range(MAP.nk)])
+    return do_tx, do_rx, out_dir[k], in_dir[k]
+
+
+def sweep_program(lv):
+    """Every op of a pass in order, for one PE's replay (tools/hang_report.py)."""
+    return sweep_z_ops(lv) + sweep_walk(lv) * sweep_geometry(lv)[0]
+
+
+def sweep_op_parts(fx, fy, op, lv):
+    """Arrays fx, fy of PEs, an op of sweep_program: a stop (has data, False); a hop
+    sweep_hop_parts; a z hop sweep_z_parts without the direction."""
+    if op[0] == "z":
+        return sweep_z_parts(fx, fy, op)[:2]
+    if op[0] == "s":
+        _, px, py = sweep_geometry(lv)
+        return sweep_origin_ok(fx - op[1] * px, fy - op[2] * py, lv), np.zeros_like(fx, dtype=bool)
+    return sweep_hop_parts(fx, fy, op, lv)
+
+
+def sweep_expected(pi):
+    """(H, W, 4) expected pass_stats[0..3] of swept pass pi: stops with data,
+    horizontal sends, vertical sends, receives. [4] is appliance_run.expected_work."""
+    _, lv = S.PASSES[pi]
+    fy, fx = np.mgrid[0:MAP.height, 0:MAP.width]
+    exp = np.zeros((MAP.height, MAP.width, 4), dtype=np.int64)
+    pieces, px, py = sweep_geometry(lv)
+    for op in sweep_walk(lv):
+        if op[0] == "s":
+            exp[:, :, 0] += sweep_origin_ok(fx - op[1] * px, fy - op[2] * py, lv)
+        else:
+            do_tx, do_rx = sweep_hop_parts(fx, fy, op, lv)
+            exp[:, :, 1 if op[1] < 2 else 2] += do_tx
+            exp[:, :, 3] += do_rx
+    exp *= pieces
+    for op in sweep_z_ops(lv):
+        do_tx, do_rx, d, _ = sweep_z_parts(fx, fy, op)
+        exp[:, :, 1] += do_tx & (d < 2)
+        exp[:, :, 2] += do_tx & (d >= 2)
+        exp[:, :, 3] += do_rx
+    return exp
 
 
 # ---------------------------------------------------------------------------
@@ -473,8 +626,9 @@ if __name__ == "__main__":
     if "--regress" in sys.argv:
         regress()
         print(f"regress OK: NK = 1 tables == GEN at {sorted(GEN_TABLES)}")
-    configure(c, p, zp)
-    print(f"C={c}  P={p}  ZP={zp}  NK={MAP.nk}  block {MAP.bw}x{MAP.bh}  "
+    lmin = next((int(a[7:]) for a in sys.argv if a.startswith("--lmin=")), None)
+    configure(c, p, zp, None, lmin)
+    print(f"C={c}  P={p}  ZP={zp}  NK={MAP.nk}  block {MAP.bw}x{MAP.bh}  sweep_lmin {SWEEP_LMIN}  "
           f"rectangle {MAP.width}x{MAP.height} = {len(PES)} PE  max_bodies_pe={mb}  "
           f"NPASS={S.NPASS}  P2P {S.p2p_cells(mb)} cells/msg")
     if "--check" in sys.argv:

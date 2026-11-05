@@ -52,6 +52,12 @@ def p2p_cells(max_bodies_pe):
     return k
 
 
+def is_sweep(pi, lmin):
+    """Is pass pi a swept M2L (pe.csl SWEEP M2L)? lmin: sweep_lmin."""
+    name, lv = PASSES[pi]
+    return name.startswith("M2L") and lv >= lmin
+
+
 def _build_passes(h):
     out = [(f"M2M{c}{c - 1}", c - 1) for c in range(h, 2, -1)]
     out += [(f"M2L{lv}", lv) for lv in range(h, 1, -1)]

@@ -9,8 +9,8 @@
 //   W     5 / 6   3 / 3             4          7 (B)
 //   N     7 / 8   4 / 4             3          6 (A)
 //   S     9 / 10  5 / 5             5          7 (B)
-// Four receive microthreads always armed (header area, lane.csl) + two send
-// microthreads shared by two output queues each (WSE-3).
+// Four receive microthreads, always armed during a D17 pass (header area, lane.csl) +
+// two send microthreads shared by two output queues each (WSE-3).
 //
 // Flow control: port d of a PE = its lane-d input (messages travelling d), one
 // data slot. A PE sends a hop in direction d only with a credit for the
@@ -296,6 +296,31 @@ fn xp_tx_step(d: u16) u16 {
         }
     }
     return k;
+}
+
+// --- Raw transfers (sweep M2L) ----------------------------------------------------
+// Both ends know each transfer from their position, so a raw transfer has no header
+// and no credit, and st, cred, owe and the engines stay as they are. The caller runs
+// at most one send and one receive at a time, and only in a pass with no D17 traffic.
+// The tx task of lane d calls xp_raw_tx_done(d): true unless no send was in flight.
+fn xp_raw_recv(d: u16, dst: [*]u32, n: u16) void {
+    if (d == DIR_E) {
+        lane_e.lane_recv(dst, n);
+    } else if (d == DIR_W) {
+        lane_w.lane_recv(dst, n);
+    } else if (d == DIR_N) {
+        lane_n.lane_recv(dst, n);
+    } else {
+        lane_s.lane_recv(dst, n);
+    }
+}
+
+fn xp_raw_send(d: u16, src: [*]u32, n: u16) void {
+    forward(d, src, n);
+}
+
+fn xp_raw_tx_done(d: u16) bool {
+    return lane_tx(d);
 }
 
 // Nothing held, owed or in flight.

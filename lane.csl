@@ -17,9 +17,10 @@
 // lane's single data slot at slot + 2, the header copied in front (so the slot
 // holds [h0][h1][payload] and can be forwarded in one op). The importer must
 // guarantee (credits) that a data message arrives only while the slot is free;
-// credits always get in, even while the slot is held.
+// credits always get in, even while the slot is held. lane_recv is the raw alternative:
+// n words anywhere, no header, for a pass with no message on the lane.
 // Send: a 2-word prefix then len payload words in place (lane_send, zero copy),
-// one op of a whole held message (lane_forward), or a credit (lane_credit). One
+// one op of a whole held message or raw words (lane_forward), or a credit (lane_credit). One
 // send at a time per lane; lanes may share a send microthread (WSE-3) if
 // the importer never starts two sends on it at once.
 //
@@ -145,6 +146,13 @@ fn arm_header() void {
 }
 
 fn lane_rx_errors() u16 { return rx_errors; }
+
+// Raw receive for the sweep M2L: n words into dst, no header stage. rx_stage and
+// rx_left stay as they are (0: no D17 receive is armed during a sweep pass), and
+// the rx task must not call lane_rx_step() for it.
+fn lane_recv(dst: [*]u32, n: u16) void {
+    arm(dst, n);
+}
 
 // Start listening for n messages (data + credits) on this lane.
 fn lane_start(n: u16) void {
