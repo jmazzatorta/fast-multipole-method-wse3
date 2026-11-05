@@ -6,6 +6,8 @@ Mirrors the device math in kernels.csl / pe.csl / geometry.csl:
   kernels.csl  compute_solid_harmonics      (order P,  C_BUF_SIZE floats)
   kernels.csl  compute_solid_harmonics_2p   (order 2P, C_BUF_M2L_SIZE floats)
   kernels.csl  translate                    (CSR loop, packed 4-bit signs)
+               translate_m2l on the device has no table: same terms in another
+               order, so M2L agrees with this reference up to f32 rounding
   kernels.csl  evaluate_l2p                 (potential and force = -grad phi)
   pe.csl       compute_p2m_cell             (multipole about the leaf centre)
   pe.csl       m2m_z_local + plane combine  (upward pass, levels TREE_H -> ... -> 2)

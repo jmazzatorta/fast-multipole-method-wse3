@@ -143,7 +143,6 @@ def main():
         f"--params=tree_h:{tree_h} "
         f"--params=order_p:{args.P} "
         f"--params=m2m_n_entries:{tsz['m2m']} "
-        f"--params=m2l_n_entries:{tsz['m2l']} "
         f"--params=l2l_n_entries:{tsz['l2l']} "
         f"--params=mp_ent_cap:{mp_ent_cap} "
         f"--params=zp_log:{pmap.lzp} "
@@ -151,8 +150,8 @@ def main():
         f"--params=blk_lbh:{pmap.lbh} "
         f"--params=MEMCPY_H2D_ID:0 "
         f"--params=MEMCPY_D2H_ID:1 "
-        # Loop-unroll budget. 500 fully unrolls the big FMM loops (M2L 375,
-        # M2M/L2L 92) and blows past per-PE code memory; 1 is too low for the
+        # Loop-unroll budget. 500 fully unrolls the big FMM loops (M2M/L2L 92)
+        # and blows past per-PE code memory; 1 is too low for the
         # system libraries (simprint's inline byte loop needs a few). 16 lets the
         # short library loops unroll while the large FMM loops (>16) stay as real
         # loops, keeping .text/.data.hi small.
@@ -179,7 +178,7 @@ def main():
           f"at fabric offsets {args.offsets}")
     print(f"  max_bodies_pe : {args.max_bodies_pe}")
     print(f"  P (order)     : {args.P}   operator tables M2M {tsz['m2m']} / "
-          f"M2L {tsz['m2l']} / L2L {tsz['l2l']} entries")
+          f"L2L {tsz['l2l']} entries (M2L: no table)")
     print(f"  passes        : {fmm_passes.NPASS}  "
           f"({' '.join(p[0] for p in fmm_passes.PASSES)})")
     print(f"  mp_ent_cap    : {mp_ent_cap}")

@@ -80,9 +80,14 @@ def _h2d(runner, sym, band, rect, n, data_type):
     """band(y0, rows) -> (rows, W, n) u32 host data of those PE rows."""
     for y0, h in _row_bands(rect, n):
         t = np.ascontiguousarray(band(y0, h), dtype=np.uint32)
+        t0 = time.time()
+        print(f"      h2d sym {sym} rows {y0}+{h} {t.nbytes / 2**20:.0f} MiB "
+              f"start {datetime.datetime.now(datetime.timezone.utc):%H:%M:%S}",
+              end=" ", flush=True)
         runner.memcpy_h2d(sym, t.ravel(), 0, y0, rect[0], h, n,
                           streaming=False, data_type=data_type,
                           nonblock=False, order=MemcpyOrder.ROW_MAJOR)
+        print(f"done in {time.time() - t0:.1f} s", flush=True)
 
 def _d2h(runner, sym, rect, n, dtype):
     out = np.zeros((rect[1], rect[0], n), dtype=dtype)
@@ -317,11 +322,12 @@ def assemble_leaf(l_dev, C):
     return out
 
 
-def compare_leaf(l_dev, ref, C, what):
-    """Compare device l_leaf with the reference.
+def compare_leaf(l_dev, ref, counts, C, what):
+    """Compare device l_leaf with the reference, on the cells that hold bodies
+    (counts: (C, C, C) [x, y, z]): pe.csl m2l_pair skips the leaf M2L of empty cells.
 
     PASS criterion: max |device - ref| / (max |ref| of that PE) <= 1e-5. f32
-    summation in a different order gives ~1e-7..1e-6 on this scale, while a
+    summation in a different order gives ~1e-7..6e-6 on this scale, while a
     lost, duplicated or corrupted message changes a whole M2L contribution and
     shows up at >= 1e-3 of the PE max.
     Also printed (informational): the error per coefficient, each scaled by its
@@ -332,6 +338,9 @@ def compare_leaf(l_dev, ref, C, what):
     nb = fmm_ref.C_BUF_SIZE
     d4 = l_dev.astype(np.float64).reshape(C, C, C, nb)
     r4 = ref.astype(np.float64).reshape(C, C, C, nb)
+    empty = np.transpose(counts, (1, 0, 2)) == 0       # d4, r4 are [y, x, z, k]
+    d4[empty] = 0.0
+    r4[empty] = 0.0
     if not np.all(np.isfinite(r4)):
         print(f"  l_leaf {what}: reference not finite, comparison skipped")
         return True
@@ -475,7 +484,7 @@ def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe, sample
             if name.startswith("M2L"):
                 # device math: M2L corrected (irregular harmonics), see fmm_tables
                 ref = fmm_ref.m2l_leaf_only(binned, ops="fixed")
-                allok &= compare_leaf(leaf, ref, C, f"after {name}")
+                allok &= compare_leaf(leaf, ref, binned[1], C, f"after {name}")
                 allok &= physics_check_m2l_leaf(leaf, bodies, C, max_bodies_pe, sample)
             else:
                 # Whole pipeline (M2M, M2L at every level, L2L) vs the
@@ -484,7 +493,7 @@ def verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe, sample
                 ref = fmm_ref.to_device_layout(
                     fmm_ref.downward(mlev, m2l_ops="fixed",
                                      l2l_ops="fixed")[fmm_ref.TREE_H])
-                allok &= compare_leaf(leaf, ref, C, f"after {name}")
+                allok &= compare_leaf(leaf, ref, binned[1], C, f"after {name}")
     except Exception as e:
         allok = False
         print(f"  l_leaf reference check FAILED to run: {e!r}")
@@ -713,10 +722,12 @@ def main():
     # operator tables (generated on the fly, see fmm_tables.py)
     import fmm_tables
     math = fmm_tables.device_tables()
-    for nm, n in fmm_tables.table_sizes().items():
+    assert "m2l_n_entries" not in compile_data["params"], \
+        "artifact built with the M2L table: this host does not load it, recompile"
+    sizes = fmm_tables.table_sizes()
+    for nm in ("m2m", "l2l"):
         nc = int(compile_data["params"][f"{nm}_n_entries"])
-        assert n == nc, f"{nm} table {n} entries != compiled {nc}: recompile"
-    for nm in ("m2m", "m2l", "l2l"):
+        assert sizes[nm] == nc, f"{nm} table {sizes[nm]} entries != compiled {nc}: recompile"
         s = math[nm]["signs"]
         assert s.dtype == np.uint32 and s.max() <= 15, f"{nm} signs bad"
 
@@ -749,10 +760,6 @@ def main():
                 "m2m_child_indices": runner.get_id("ptr_m2m_child_indices"),
                 "m2m_v_indices": runner.get_id("ptr_m2m_v_indices"),
                 "m2m_signs": runner.get_id("ptr_m2m_signs"),
-                "m2l_offsets": runner.get_id("ptr_m2l_offsets"),
-                "m2l_source_indices": runner.get_id("ptr_m2l_source_indices"),
-                "m2l_v_indices": runner.get_id("ptr_m2l_v_indices"),
-                "m2l_signs": runner.get_id("ptr_m2l_signs"),
                 "l2l_offsets": runner.get_id("ptr_l2l_offsets"),
                 "l2l_source_indices": runner.get_id("ptr_l2l_source_indices"),
                 "l2l_v_indices": runner.get_id("ptr_l2l_v_indices"),
@@ -767,7 +774,6 @@ def main():
             print("[3/4] Pushing data...")
             # math tables (broadcast)
             for nm, keys in (("m2m", ("offsets","child_indices","v_indices")),
-                             ("m2l", ("offsets","source_indices","v_indices")),
                              ("l2l", ("offsets","source_indices","v_indices"))):
                 h2d_bcast_u16(runner, sym[f"{nm}_offsets"], math[nm]["offsets"], rect)
                 idxkey = "child_indices" if nm == "m2m" else "source_indices"
@@ -913,6 +919,7 @@ def main():
             print(f"[appliance_run] forces_phys.npy: cell edge {args.cell_size} "
                   f"(scale {s_phys:.6g} per internal unit)")
 
+    print(f"[appliance_run] OVERALL: {'FAIL: ' + err if err else 'PASS'}")
     sys.stdout = original_stdout
     with open(os.path.join(run_dir, "run.log"), "w") as f:
         f.write(log_buf.getvalue())

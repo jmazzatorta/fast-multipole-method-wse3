@@ -44,7 +44,6 @@ param cell_size : f32;
 param tree_h : u16;           // H = log2(C)
 param order_p : u16;          // expansion order P
 param m2m_n_entries : u16;    // operator table sizes for order P (fmm_tables)
-param m2l_n_entries : u16;
 param l2l_n_entries : u16;
 
 // --- TOPOLOGY PARAMETERS (from layout, identical on every PE) ---
@@ -74,7 +73,6 @@ const cons = @import_module("constants.csl", .{
     .order_p = order_p,
     .zp_log = zp_log,
     .m2m_n_entries = m2m_n_entries,
-    .m2l_n_entries = m2l_n_entries,
     .l2l_n_entries = l2l_n_entries,
 });
 const geom = @import_module("geometry.csl", .{
@@ -85,7 +83,6 @@ const geom = @import_module("geometry.csl", .{
 const kernels = @import_module("kernels.csl", .{
     .P = cons.P,
     .M2M_N_ENTRIES = cons.M2M_N_ENTRIES,
-    .M2L_N_ENTRIES = cons.M2L_N_ENTRIES,
     .L2L_N_ENTRIES = cons.L2L_N_ENTRIES,
     .N_BUCKETS = cons.N_BUCKETS,
 });
@@ -115,16 +112,11 @@ var center_y : f32 = 0.0;   // (pe_y + 0.5) * cell_size, fixed for column
 // ===========================================================================
 // Identical to 3D: these are the reused, geometry-independent tables. Signs are
 // 4 bits packed into a u32 (upper 16 bits zero, memcpy requires u32 device
-// buffers). Same per PE (not scaling with C): ~4.46 KB.
+// buffers). Same per PE (not scaling with C). M2L has no table (kernels.translate_m2l).
 export var m2m_offsets       = @zeros([cons.N_BUCKETS]u16);
 export var m2m_child_indices = @zeros([cons.M2M_N_ENTRIES]u16);
 export var m2m_v_indices     = @zeros([cons.M2M_N_ENTRIES]u16);
 export var m2m_signs         = @zeros([cons.M2M_N_ENTRIES]u32);
-
-export var m2l_offsets        = @zeros([cons.N_BUCKETS]u16);
-export var m2l_source_indices = @zeros([cons.M2L_N_ENTRIES]u16);
-export var m2l_v_indices      = @zeros([cons.M2L_N_ENTRIES]u16);
-export var m2l_signs          = @zeros([cons.M2L_N_ENTRIES]u32);
 
 export var l2l_offsets        = @zeros([cons.N_BUCKETS]u16);
 export var l2l_source_indices = @zeros([cons.L2L_N_ENTRIES]u16);
@@ -233,10 +225,18 @@ fn m2l_planar(tbx: u16, tby: u16, sbx: u16, sby: u16) bool {
     return dpx >= -1 and dpx <= 1 and dpy >= -1 and dpy <= 1;
 }
 
+// All coefficients zero: a source box with no bodies below it.
+fn expansion_is_zero(exp: [*]f32) bool {
+    for (@range(u16, cons.C_BUF_SIZE)) |k| {
+        if (exp[k] != 0.0) return false;
+    }
+    return true;
+}
+
 // Pair (source box z = src_z, target local node tn) at `level`, plane offset
 // (dxp, dyp) = target - source, mxy = max(|dxp|, |dyp|): translate if it is in
-// the interaction list. Returns true when it translated (the caller counts it in
-// pass_stats[4]).
+// the interaction list, unless the source or the leaf target is empty. Returns true for a pair of
+// the list (the caller counts it in pass_stats[4]).
 fn m2l_pair(level: u16, dxp: i16, dyp: i16, mxy: i16, src_z: u16, tn: u16,
             src_exp: [*]f32) bool {
     const tz : u16 = level_zbase(level) + tn;
@@ -246,20 +246,19 @@ fn m2l_pair(level: u16, dxp: i16, dyp: i16, mxy: i16, src_z: u16, tn: u16,
     const adz : i16 = if (dz < 0) -dz else dz;
     const mx : i16 = if (adz > mxy) adz else mxy;
     if (mx < 2) return false;                           // adjacent: near field
+    if (expansion_is_zero(src_exp)) return true;        // empty source: adds nothing
+    // Empty leaf target: no body evaluates it (appliance_run.compare_leaf ignores it).
+    if (level == cons.TREE_H and @as(u16, bodies_col[tn * CELL_BLOCK]) == 0) return true;
 
     const l_target = l_level_ptr(level);
     var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
     geom.get_physical_distances(dxp, dyp, dz, cons.box_size_at_level(level),
                                 &dist_x, &dist_y, &dist_z);
-    kernels.compute_irregular_harmonics_2p(dist_x, dist_y, dist_z, &v_buf_m2l);
-    kernels.translate(
+    kernels.compute_irregular_harmonics_2p(-dist_x, dist_y, -dist_z, &v_buf_m2l);
+    kernels.translate_m2l(
         @ptrcast([*]f32, &v_buf_m2l[0]),
         src_exp,
-        @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]),
-        @ptrcast([*]u16, &m2l_offsets[0]),
-        @ptrcast([*]u16, &m2l_source_indices[0]),
-        @ptrcast([*]u16, &m2l_v_indices[0]),
-        @ptrcast([*]u32, &m2l_signs[0]));
+        @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]));
     return true;
 }
 
@@ -493,7 +492,7 @@ fn m2l_next() bool {
         if (cm_tn >= ntz) { cm_tn = 0; cm_ci += 1; }
         if (m2l_pair(pass_dlevel, cm_dxp, cm_dyp, cm_mxy, cm_zb + ci, tn,
                      @ptrcast([*]f32, &pl[ci * cons.C_BUF_SIZE]))) {
-            pass_stats[4] += 1;     // applied translations (diagnostic)
+            pass_stats[4] += 1;     // pairs of the list, empty ones included (diagnostic)
             return true;
         }
     }
@@ -1176,6 +1175,7 @@ fn clear_level_buffers() void {
 // the parents' owners by the first M2M pass).
 export fn run_p2m() void {
     time_mod.enable_tsc();       // resets this PE's counter: once per run
+    kernels.m2l_init();
     tsc_mark(0, 0);
     tsc_mark(0, 1);
     init_position();
@@ -1247,10 +1247,6 @@ var ptr_m2m_child_indices : [*]u16 = &m2m_child_indices;
 var ptr_m2m_v_indices : [*]u16 = &m2m_v_indices;
 var ptr_m2m_signs : [*]u32 = &m2m_signs;
 
-var ptr_m2l_offsets : [*]u16 = &m2l_offsets;
-var ptr_m2l_source_indices : [*]u16 = &m2l_source_indices;
-var ptr_m2l_v_indices : [*]u16 = &m2l_v_indices;
-var ptr_m2l_signs : [*]u32 = &m2l_signs;
 
 var ptr_l2l_offsets : [*]u16 = &l2l_offsets;
 var ptr_l2l_source_indices : [*]u16 = &l2l_source_indices;
@@ -1295,10 +1291,6 @@ comptime {
     @export_symbol(ptr_m2m_v_indices, "ptr_m2m_v_indices");
     @export_symbol(ptr_m2m_signs, "ptr_m2m_signs");
 
-    @export_symbol(ptr_m2l_offsets, "ptr_m2l_offsets");
-    @export_symbol(ptr_m2l_source_indices, "ptr_m2l_source_indices");
-    @export_symbol(ptr_m2l_v_indices, "ptr_m2l_v_indices");
-    @export_symbol(ptr_m2l_signs, "ptr_m2l_signs");
 
     @export_symbol(ptr_l2l_offsets, "ptr_l2l_offsets");
     @export_symbol(ptr_l2l_source_indices, "ptr_l2l_source_indices");

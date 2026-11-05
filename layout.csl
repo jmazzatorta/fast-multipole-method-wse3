@@ -22,7 +22,6 @@ param max_bodies_pe : u16;              // max bodies per leaf cell
 param tree_h : u16;                     // H = log2(C)
 param order_p : u16;                    // P
 param m2m_n_entries : u16;
-param m2l_n_entries : u16;
 param l2l_n_entries : u16;
 // mp_ent_cap = size of the per-PE send table of the transport, set by
 // appliance_compile.py (zmp_tables.py) and read back from out.json.
@@ -76,7 +75,6 @@ layout {
                 .tree_h = tree_h,
                 .order_p = order_p,
                 .m2m_n_entries = m2m_n_entries,
-                .m2l_n_entries = m2l_n_entries,
                 .l2l_n_entries = l2l_n_entries,
                 .mp_ent_cap = mp_ent_cap,
                 .parity = fx & 1,
@@ -112,10 +110,6 @@ layout {
     @export_name("ptr_m2m_v_indices", [*]u16, true);
     @export_name("ptr_m2m_signs", [*]u32, true);
 
-    @export_name("ptr_m2l_offsets", [*]u16, true);
-    @export_name("ptr_m2l_source_indices", [*]u16, true);
-    @export_name("ptr_m2l_v_indices", [*]u16, true);
-    @export_name("ptr_m2l_signs", [*]u32, true);
 
     @export_name("ptr_l2l_offsets", [*]u16, true);
     @export_name("ptr_l2l_source_indices", [*]u16, true);

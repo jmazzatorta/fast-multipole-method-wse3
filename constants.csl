@@ -24,7 +24,6 @@ param zp_log : u16;           // log2(ZP): ZP = leaf cells per PE along z (ZP = 
 // Operator table sizes for order P, from the generator (fmm_tables.py
 // table_sizes(), passed by appliance_compile.py). Do NOT hand-edit.
 param m2m_n_entries : u16;
-param m2l_n_entries : u16;
 param l2l_n_entries : u16;
 
 
@@ -67,9 +66,8 @@ const C_BUF_SIZE : u16 = N_COEFFS * 2;                 // 30 at P=4 (interleaved
 const N_COEFFS_V : u16 = (2*P + 1) * (2*P + 2) / 2;    // 45 at P=4
 const C_BUF_M2L_SIZE : u16 = N_COEFFS_V * 2;           // 90 at P=4
 
-// --- Operator table sizes (P=4: M2M 92, M2L 375, L2L 105) ---
+// --- Operator table sizes (P=4: M2M 92, L2L 105; M2L has no table) ---
 const M2M_N_ENTRIES : u16 = m2m_n_entries;
-const M2L_N_ENTRIES : u16 = m2l_n_entries;
 const L2L_N_ENTRIES : u16 = l2l_n_entries;
 
 // Number of CSR-style buckets in the operator tables: one per target coeff,

@@ -190,8 +190,8 @@ def device_tables():
                   "m2l": _pack(gen_m2l_tables(), "source_indices"),
                   "l2l": _pack(gen_l2l_tables(), "source_indices")}
         if P == 4:
-            # must match M2M_N_ENTRIES / M2L_N_ENTRIES / L2L_N_ENTRIES
-            # (constants.csl)
+            # M2M_N_ENTRIES / L2L_N_ENTRIES (constants.csl); the M2L table is
+            # fmm_ref's: the device has none (kernels.translate_m2l)
             n = table_sizes()
             assert n == {"m2m": 92, "m2l": 375, "l2l": 105}, n
     return _CACHE

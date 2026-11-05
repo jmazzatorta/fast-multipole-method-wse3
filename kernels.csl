@@ -20,14 +20,11 @@
 // The two differ only in bit 31, so for a "negative" flag in {0,1}:
 //   float = bitcast<f32>(0x3F800000 | (negative << 31))
 //
-// NOTE on M2L_N_ENTRIES: this parameter is DERIVED from the table generator,
-// not hand-coded. For P=4 the generator emits 375 M2L entries (M2M = L2L = 92).
-// constants25d.csl and the generated data blob must agree with the generator by
-// construction; do not hand-edit this number.
+// NOTE on the entry counts: they are DERIVED from the table generator, not
+// hand-coded. M2L has no table: translate_m2l.
 
 param P: u16;
 param M2M_N_ENTRIES: u16;
-param M2L_N_ENTRIES: u16;
 param L2L_N_ENTRIES: u16;
 param N_BUCKETS: u16;
 
@@ -122,7 +119,7 @@ fn compute_solid_harmonics(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_SIZE]f32) voi
 //   I_0^0 = 1/r
 //   I_m^m = -(2m-1) (x + i y) / r^2 * I_{m-1}^{m-1}
 //   I_l^m = ((2l-1) z I_{l-1}^m - ((l-1)^2 - m^2) I_{l-2}^m) / r^2
-// Used with the M2L table of fmm_tables.gen_m2l_tables:
+// Used by translate_m2l:
 //   L_j^p = (-1)^j sum_{n,k} M_n^k conj(I_{n+j}^{p+k}(v)),  v = c_t - c_s.
 // Mirrors fmm_ref.compute_irregular_harmonics_2p (same f32 operation order).
 fn compute_irregular_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f32) void {
@@ -183,20 +180,13 @@ fn compute_irregular_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SI
 // already brought the source expansion into local SRAM (via a plane exchange);
 // the accumulation here is identical to 3D.
 
-// --- Unified sparse translation (M2M / M2L / L2L) ---
+// --- Sparse translation (M2M / L2L; M2L: translate_m2l) ---
 //
-// The three operators (M2M upward, M2L, L2L downward) are the SAME sparse
-// translation of one expansion through a precomputed CSR operator table
-// (offsets + source/v indices + packed signs). They were three byte-identical
-// copies differing only in the array-length type annotations and the v_buf size
-// (90 for M2L, 30 for M2M/L2L). Collapsed into ONE function to cut .text (two
-// copies of the heaviest arithmetic block + their inlined decode_sign sites
-// removed). Pointers are unsized [*]T: the loop is CSR-bounded by `offsets`, so
-// the compile-time array length is never used in the body. Math is byte-for-byte
-// identical to the three originals — verified numerically to rel ~1e-15.
-//   src_buf = the source expansion (child for M2M, source for M2L, parent for
-//   L2L); tgt_buf = the target it accumulates (+=) into; v_buf = translation-
-//   vector harmonics (30 floats for M2M/L2L, 90 for M2L).
+// One expansion through a precomputed CSR operator table (offsets + source/v
+// indices + packed signs). Pointers are unsized [*]T: the loop is CSR-bounded by
+// `offsets`, so the compile-time array length is never used in the body.
+//   src_buf = the source expansion (child for M2M, parent for L2L); tgt_buf = the
+//   target it accumulates (+=) into; v_buf = translation-vector harmonics.
 fn translate(
     v_buf: [*]f32,
     src_buf: [*]f32,
@@ -229,6 +219,90 @@ fn translate(
         const p_idx: u16 = f_idx * 2;
         tgt_buf[p_idx] += accum_r;
         tgt_buf[p_idx + 1] += accum_i;
+    }
+}
+
+
+// --- M2L without a table ---
+//
+//   L_j^p = (-1)^n sum_{n,k} M_n^k W_{n+j}^{p+k},  W^{-m} = (-1)^m conj(W^m),
+// with W = compute_irregular_harmonics_2p(-x, y, -z) of v = (x, y, z) = c_t - c_s,
+// which absorbs (-1)^j and the conjugate of the table form. For fixed (n, k, p),
+// L_j^p and W_{n+j}^{p+k} are contiguous over j = p..P with stride 2 (re or im), so
+// each of the four real products is one @fmacs. Operands zero by structure are
+// skipped (Im M_n^0, Im W^0, Im L_j^0). Same result as translate with the M2L table
+// up to f32 rounding (same terms, other order); the host checks it (compare_leaf).
+var m2l_row = @zeros([P + 1]u16);        // float index of (m, m), order P
+var m2l_row_2p = @zeros([2 * P + 1]u16); // same, order 2P
+var m2l_anchor = @zeros([2]f32);
+
+// Call once before the first translate_m2l.
+fn m2l_init() void {
+    var a : u16 = 0;
+    var b : u16 = 0;
+    for (@range(u16, 2 * P + 1)) |m| {
+        if (m <= P) {
+            m2l_row[m] = a;
+            a += 2 * (P + 1 - m);
+        }
+        m2l_row_2p[m] = b;
+        b += 2 * (2 * P + 1 - m);
+    }
+}
+
+fn m2l_run(tgt: [*]f32, t: u16, w: [*]f32, v: u16, n: u16, s: f32) void {
+    var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_anchor[2 * ix] });
+    d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tgt[t]));
+    d = @set_dsd_length(d, n);
+    var c = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_anchor[2 * ix] });
+    c = @set_dsd_base_addr(c, @ptrcast([*]f32, &w[v]));
+    c = @set_dsd_length(c, n);
+    @fmacs(d, d, c, s);
+}
+
+// Accumulates (+=) into tgt. w: harmonics as above; src: the source expansion.
+fn translate_m2l(w: [*]f32, src: [*]f32, tgt: [*]f32) void {
+    for (@range(u16, P + 1)) |n| {
+        const s0 : f32 = if ((n & 1) == 1) -1.0 else 1.0;
+        const ni : i16 = @as(i16, n);
+        var k : i16 = -ni;
+        while (k <= ni) {
+            const ak : u16 = @as(u16, if (k < 0) -k else k);
+            const a_i : u16 = m2l_row[ak] + 2 * (n - ak);
+            const a : f32 = src[a_i];
+            const b : f32 = src[a_i + 1];
+            const k_odd : bool = (ak & 1) == 1;
+            for (@range(u16, P + 1)) |q| {
+                const m : i16 = @as(i16, q) + k;
+                const am : u16 = @as(u16, if (m < 0) -m else m);
+                const len : u16 = P + 1 - q;
+                const t_r : u16 = m2l_row[q];
+                const t_i : u16 = t_r + 1;
+                const c_v : u16 = m2l_row_2p[am] + 2 * (n + q - am);
+                const d_v : u16 = c_v + 1;
+                // (a + ib)(c + id) with the conjugates of k < 0 and m < 0
+                var s : f32 = s0;
+                var sb : f32 = -1.0;     // sign of b d in Re
+                var sd : f32 = 1.0;      // sign of a d in Im
+                var si : f32 = 1.0;      // sign of b c in Im
+                if (k < 0) {
+                    if (k_odd) s = -s;
+                    if (m >= 0) {
+                        sb = 1.0; si = -1.0;
+                    } else {
+                        if ((am & 1) == 1) s = -s;
+                        sd = -1.0; si = -1.0;
+                    }
+                }
+                m2l_run(tgt, t_r, w, c_v, len, s * a);
+                if (k != 0 and m != 0) m2l_run(tgt, t_r, w, d_v, len, s * sb * b);
+                if (q != 0) {
+                    if (m != 0) m2l_run(tgt, t_i, w, d_v, len, s * sd * a);
+                    if (k != 0) m2l_run(tgt, t_i, w, c_v, len, s * si * b);
+                }
+            }
+            k += 1;
+        }
     }
 }
 
