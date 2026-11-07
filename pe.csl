@@ -434,7 +434,7 @@ fn pass_consume(header: u32, payload: [*]f32) void {
         if (adx <= 1 and ady <= 1) {
             const pw = @ptrcast([*]u32, payload);
             for (@range(u16, zc)) |ci| {
-                p2p_from_cell(zb + ci, @ptrcast([*]u32, &pw[ci * CELL_BLOCK]));
+                p2p_from_cell(zb + ci, @ptrcast([*]u32, &pw[ci * CELL_BLOCK]), false);
             }
         }
     }
@@ -546,6 +546,7 @@ fn pass_prepare(pass: u16) void {
     if (pass_is_sweep(pass)) {
         sw_prepare(pass_dlevel);
     }
+    if (cur_kind == KIND_P2P) p2p_init();
 }
 
 // Local work of the pass (no message): M2L pairs with source and target on
@@ -1533,53 +1534,122 @@ fn l2l_z_local(parent_level: u16) void {
 // The local part (source cells on this PE, 0 hops) runs at the begin of pass
 // P2P; the other neighbour cells (plane-neighbour columns, and the adjacent
 // cells of the own column on the other chunks) arrive as messages.
-const math_mod = @import_module("<math>");
-fn math_sqrt(x: f32) f32 { return math_mod.sqrt(x); }
+//
+// One source against all the targets of a cell, read in place at stride 4: vector inverse square
+// root, first guess by 16-bit DSD ops on the high halves of the floats, three Newton steps
+// (testbench/kernels/kt2_*: force error 2.4e-7). The low halves of p2p_y stay 0.
+// Work arrays: the M2L scratch of kernels.csl, free here because every M2L is done before P2P. A
+// second run needs a new load, since translate_m2l relies on zeros in W.
+const P2P_MAGIC_HI : u16 = 0x5F37;
+var p2p_a1 = @zeros([1]f32);
+var p2p_a1u = @zeros([1]u16);
+var p2p_a2 = @zeros([2]u16);
+var p2p_a4 = @zeros([4]f32);
+const p2p_a1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> p2p_a1[ix] });
+const p2p_a1u_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> p2p_a1u[ix] });
+const p2p_a2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> p2p_a2[2 * ix] });
+const p2p_a4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> p2p_a4[4 * ix] });
 
-// Force and potential on every body of target cell tn (local index) of this
-// PE from the bodies of ONE source cell block `src` (layout of bodies_col:
-// count, then x, y, z, q per body). Pairs with r2 <= 1e-10 (a body with
-// itself) are skipped. Accumulates into forces_col.
-fn p2p_accumulate(tn: u16, src: [*]u32) void {
+fn p2p_work(p: [*]f32, n: u16) mem1d_dsd {
+    return @set_dsd_length(@set_dsd_base_addr(p2p_a1_dsd, p), n);
+}
+
+fn p2p_stride4(p: [*]f32, n: u16) mem1d_dsd {
+    return @set_dsd_length(@set_dsd_base_addr(p2p_a4_dsd, p), n);
+}
+
+// When pass P2P is prepared. The low halves of the guess stay 0.
+fn p2p_init() void {
+    @fmovs(p2p_work(@ptrcast([*]f32, &kernels.m2l_wr[0]), max_bodies_pe), 0.0);
+    @fmovs(p2p_work(@ptrcast([*]f32, &kernels.m2l_wr[2 * max_bodies_pe]), max_bodies_pe), 1.5);
+    @mov16(@set_dsd_length(@set_dsd_base_addr(p2p_a1u_dsd, @ptrcast([*]u16, &kernels.m2l_li[0])), max_bodies_pe), P2P_MAGIC_HI);
+}
+
+// Force and potential on every body of target cell tn (local index) of this PE from the bodies
+// of ONE source cell block `src` (layout of bodies_col: count, then x, y, z, q per body).
+// own: the source cell is the target cell, so source si meets itself at target si: r^2 is
+// replaced there, dx = dy = dz = 0 gives no force and q * 1e-15 on the potential.
+// Accumulates into forces_col.
+fn p2p_accumulate(tn: u16, src: [*]u32, own: bool) void {
     const scount : u16 = @as(u16, src[0]);
     const tblk : u16 = tn * CELL_BLOCK;
-    const tcount : u16 = @as(u16, bodies_col[tblk]);
-    const fcell_base : u16 = tn * (max_bodies_pe * 4);
-    for (@range(u16, tcount)) |ti| {
-        const ib : u16 = tblk + 1 + ti * 4;
-        const tx : f32 = @bitcast(f32, bodies_col[ib]);
-        const ty : f32 = @bitcast(f32, bodies_col[ib + 1]);
-        const tzc : f32 = @bitcast(f32, bodies_col[ib + 2]);
-        var fx : f32 = 0.0; var fy : f32 = 0.0; var fz : f32 = 0.0; var pot : f32 = 0.0;
-        for (@range(u16, scount)) |ri| {
-            const rb : u16 = 1 + ri * 4;
-            const ddx = @bitcast(f32, src[rb]) - tx;
-            const ddy = @bitcast(f32, src[rb + 1]) - ty;
-            const ddz = @bitcast(f32, src[rb + 2]) - tzc;
-            const rq : f32 = @bitcast(f32, src[rb + 3]);
-            const r2 = ddx*ddx + ddy*ddy + ddz*ddz;
-            if (r2 > 1e-10) {
-                const rinv = 1.0 / math_sqrt(r2);
-                const ff = rq * rinv * rinv * rinv;
-                fx += ff * ddx; fy += ff * ddy; fz += ff * ddz;
-                pot += rq * rinv;
-            }
-        }
-        const fo : u16 = fcell_base + ti * 4;
-        forces_col[fo]     += fx;
-        forces_col[fo + 1] += fy;
-        forces_col[fo + 2] += fz;
-        forces_col[fo + 3] += pot;
-    }
+    const n : u16 = @as(u16, bodies_col[tblk]);
     pass_stats[4] += 1;     // (target cell, source cell) pairs (diagnostic)
+    if (n == 0 or scount == 0) return;
+    const fo : u16 = tn * (max_bodies_pe * 4);
+    const tx = p2p_stride4(@ptrcast([*]f32, &bodies_col[tblk + 1]), n);
+    const ty = p2p_stride4(@ptrcast([*]f32, &bodies_col[tblk + 2]), n);
+    const tz = p2p_stride4(@ptrcast([*]f32, &bodies_col[tblk + 3]), n);
+    const fx = p2p_stride4(@ptrcast([*]f32, &forces_col[fo]), n);
+    const fy = p2p_stride4(@ptrcast([*]f32, &forces_col[fo + 1]), n);
+    const fz = p2p_stride4(@ptrcast([*]f32, &forces_col[fo + 2]), n);
+    const fp = p2p_stride4(@ptrcast([*]f32, &forces_col[fo + 3]), n);
+    const dx = p2p_work(@ptrcast([*]f32, &kernels.m2l_wi[0]), n);
+    const dy = p2p_work(@ptrcast([*]f32, &kernels.m2l_wi[max_bodies_pe]), n);
+    const dz = p2p_work(@ptrcast([*]f32, &kernels.m2l_wi[2 * max_bodies_pe]), n);
+    const r2 = p2p_work(@ptrcast([*]f32, &kernels.m2l_wi[3 * max_bodies_pe]), n);
+    const t = p2p_work(@ptrcast([*]f32, &kernels.m2l_lr[0]), n);
+    const y = p2p_work(@ptrcast([*]f32, &kernels.m2l_wr[0]), n);
+    const w = p2p_work(@ptrcast([*]f32, &kernels.m2l_wr[max_bodies_pe]), n);
+    const c = p2p_work(@ptrcast([*]f32, &kernels.m2l_wr[2 * max_bodies_pe]), n);
+    const mag = @set_dsd_length(@set_dsd_base_addr(p2p_a1u_dsd, @ptrcast([*]u16, &kernels.m2l_li[0])), n);
+    var r2_hi = @set_dsd_base_addr(p2p_a2_dsd, @ptrcast([*]u16, &kernels.m2l_wi[3 * max_bodies_pe]));
+    r2_hi = @increment_dsd_offset(r2_hi, 1, u16);
+    r2_hi = @set_dsd_length(r2_hi, n);
+    var y_hi = @set_dsd_base_addr(p2p_a2_dsd, @ptrcast([*]u16, &kernels.m2l_wr[0]));
+    y_hi = @increment_dsd_offset(y_hi, 1, u16);
+    y_hi = @set_dsd_length(y_hi, n);
+    const MINUS_HALF : f32 = -0.5;
+    for (@range(u16, scount)) |si| {
+        const sb : u16 = 1 + si * 4;
+        const sx : f32 = @bitcast(f32, src[sb]);
+        const sy : f32 = @bitcast(f32, src[sb + 1]);
+        const sz : f32 = @bitcast(f32, src[sb + 2]);
+        const sq : f32 = @bitcast(f32, src[sb + 3]);
+        @fsubs(dx, sx, tx);
+        @fsubs(dy, sy, ty);
+        @fsubs(dz, sz, tz);
+        @fmuls(r2, dx, dx);
+        @fmuls(t, dy, dy);
+        @fadds(r2, r2, t);
+        @fmuls(t, dz, dz);
+        @fadds(r2, r2, t);
+        if (own) {
+            kernels.m2l_wi[3 * max_bodies_pe + si] = 1.0e30;
+        }
+        @slr16(y_hi, r2_hi, @as(u16, 1));
+        @sub16(y_hi, mag, y_hi);
+        @fmuls(t, y, y);
+        @fmuls(t, t, r2);
+        @fmacs(t, c, t, MINUS_HALF);
+        @fmuls(w, y, t);
+        @fmuls(t, w, w);
+        @fmuls(t, t, r2);
+        @fmacs(t, c, t, MINUS_HALF);
+        @fmuls(w, w, t);
+        @fmuls(t, w, w);
+        @fmuls(t, t, r2);
+        @fmacs(t, c, t, MINUS_HALF);
+        @fmuls(w, w, t);
+        @fmacs(fp, fp, w, sq);
+        @fmuls(t, w, w);
+        @fmuls(t, t, w);
+        @fmuls(t, t, sq);
+        @fmuls(dx, dx, t);
+        @fadds(fx, fx, dx);
+        @fmuls(dy, dy, t);
+        @fadds(fy, fy, dy);
+        @fmuls(dz, dz, t);
+        @fadds(fz, fz, dz);
+    }
 }
 
 // Source cell sz (global z, of this or a neighbour column) acts on the target
 // cells sz-1, sz, sz+1 held by this PE (z0 .. z0 + ZP - 1).
-fn p2p_from_cell(sz: u16, src: [*]u32) void {
+fn p2p_from_cell(sz: u16, src: [*]u32, local: bool) void {
     var tz : u16 = if (sz > z0) sz - 1 else z0;
     while (tz <= sz + 1 and tz < z0 + cons.ZP) {
-        p2p_accumulate(tz - z0, src);
+        p2p_accumulate(tz - z0, src, local and tz == sz);
         tz += 1;
     }
 }
@@ -1588,7 +1658,7 @@ fn p2p_from_cell(sz: u16, src: [*]u32) void {
 fn p2p_column_local() void {
     var n : u16 = 0;
     while (n < cons.ZP) {
-        p2p_from_cell(z0 + n, @ptrcast([*]u32, &bodies_col[n * CELL_BLOCK]));
+        p2p_from_cell(z0 + n, @ptrcast([*]u32, &bodies_col[n * CELL_BLOCK]), true);
         n += 1;
     }
 }
@@ -1819,6 +1889,8 @@ var ptr_mp_ent : [*]u16 = &mp_ent;
 // COMPTIME
 // ===========================================================================
 comptime {
+    @comptime_assert(3 * max_bodies_pe <= kernels.M2L_W_LEN and 4 * max_bodies_pe <= kernels.M2L_W_LEN);   // P2P work arrays
+    @comptime_assert(max_bodies_pe <= kernels.M2L_L_LEN);
     @comptime_assert(P2P_CELLS >= 1);   // max_bodies_pe too large for one cell
 
     // Sweep: levels with every chunk of a holder column holding boxes, so 2^(H -

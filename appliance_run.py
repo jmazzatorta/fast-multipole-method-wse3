@@ -610,6 +610,10 @@ def main():
                              "two launches (~7.5 s at 128^3 P4) and their reference "
                              "checks dominate the host time; counts, forces and "
                              "the TSC log are still checked")
+    parser.add_argument("--defer-checks", action="store_true",
+                        help="save device_data.npz and stop: no physics check, no pass "
+                             "verification. The verdict is a later --verify-only on the run "
+                             "folder (the campaign runs it while the wafer runs the next one)")
     parser.add_argument("--verify-only", default=None, metavar="RUN_DIR",
                         help="re-run the verification on RUN_DIR/device_data.npz "
                              "(no device needed)")
@@ -638,6 +642,7 @@ def main():
                                        int(d["max_bodies_pe"]), args.check_sample)
         if "tsc" in d.files:
             print_tsc(d["tsc"])
+        print(f"[appliance_run] OVERALL: {'PASS' if ok else 'FAIL: verification failed'} (verify-only)")
         sys.exit(0 if ok else 1)
     if not args.label:
         parser.error("--label is required (unless --verify-only)")
@@ -949,7 +954,7 @@ def main():
     if tsc is not None:
         print_tsc(tsc)
 
-    if forces_3d is not None and STEP_L2P in completed:
+    if forces_3d is not None and STEP_L2P in completed and not args.defer_checks:
         print("\n--- physics: device forces (complete FMM) vs direct N-body ---")
         if not physics_check_forces(forces_3d, bodies, C, max_bodies_pe,
                                     args.check_sample) and err is None:
@@ -966,10 +971,13 @@ def main():
                  **({"forces": forces_3d} if forces_3d is not None and STEP_L2P in completed else {}),
                  **({"tsc": tsc} if tsc is not None else {}),
                  **({"fmm_done": stuck_done} if stuck_done is not None else {}))
-        ok = verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe,
-                          args.check_sample)
-        if not ok and err is None:
-            err = "verification failed"
+        if args.defer_checks:
+            print("[appliance_run] checks deferred: run --verify-only on " + run_dir)
+        else:
+            ok = verify_passes(pass_stats, leaf_checkpoints, bodies, C, max_bodies_pe,
+                              args.check_sample)
+            if not ok and err is None:
+                err = "verification failed"
 
     if forces_3d is not None:
         np.save(os.path.join(run_dir, "forces_device.npy"), forces_3d)
@@ -983,7 +991,10 @@ def main():
             print(f"[appliance_run] forces_phys.npy: cell edge {args.cell_size} "
                   f"(scale {s_phys:.6g} per internal unit)")
 
-    print(f"[appliance_run] OVERALL: {'FAIL: ' + err if err else 'PASS'}")
+    if args.defer_checks and not err:
+        print("[appliance_run] OVERALL: DEFERRED (device run complete, checks not run)")
+    else:
+        print(f"[appliance_run] OVERALL: {'FAIL: ' + err if err else 'PASS'}")
     sys.stdout = original_stdout
     with open(os.path.join(run_dir, "run.log"), "w") as f:
         f.write(log_buf.getvalue())
