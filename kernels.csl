@@ -31,8 +31,6 @@ param N_BUCKETS: u16;
 const N_COEFFS: u16 = (P + 1) * (P + 2) / 2;
 const C_BUF_SIZE: u16 = N_COEFFS * 2;
 
-const N_COEFFS_M2L: u16 = (2*P+1) * (2*P+2) / 2;
-const C_BUF_M2L_SIZE: u16 = N_COEFFS_M2L * 2;
 
 const math = @import_module("<math>");
 
@@ -111,67 +109,6 @@ fn compute_solid_harmonics(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_SIZE]f32) voi
 }
 
 
-// IRREGULAR solid harmonics I_l^m(v) up to order 2P, for M2L. Same buffer
-// layout as compute_solid_harmonics (m outer, l inner, interleaved re/im):
-// N_COEFFS_M2L = (2P+1)(2P+2)/2 complex values. Normalisation of the device
-// recurrences: I_l^m = (l-m)! P_l^m(cos t) e^{i m phi} / r^{l+1}. Trig-free
-// Cartesian recurrence, one sqrt and one division:
-//   I_0^0 = 1/r
-//   I_m^m = -(2m-1) (x + i y) / r^2 * I_{m-1}^{m-1}
-//   I_l^m = ((2l-1) z I_{l-1}^m - ((l-1)^2 - m^2) I_{l-2}^m) / r^2
-// Used by translate_m2l:
-//   L_j^p = (-1)^j sum_{n,k} M_n^k conj(I_{n+j}^{p+k}(v)),  v = c_t - c_s.
-// Mirrors fmm_ref.compute_irregular_harmonics_2p (same f32 operation order).
-fn compute_irregular_harmonics_2p(dx: f32, dy: f32, dz: f32, buf: *[C_BUF_M2L_SIZE]f32) void {
-    for (@range(u16, C_BUF_M2L_SIZE)) |i| {
-        buf.*[i] = 0.0;
-    }
-
-    const r2: f32 = dx * dx + dy * dy + dz * dz;
-    const inv_r2: f32 = 1.0 / r2;
-    var mm_r: f32 = 1.0 / math.sqrt(r2);
-    var mm_c: f32 = 0.0;
-    var i_m: u16 = 0;
-
-    const P2: i16 = 2 * @as(i16, P);
-
-    for (@range(i16, P2 + 1)) |m| {
-        if (m > 0) {
-            const k_diag: f32 = @as(f32, -(2 * m - 1)) * inv_r2;
-            const temp_r: f32 = k_diag * (dx * mm_r - dy * mm_c);
-            const temp_c: f32 = k_diag * (dy * mm_r + dx * mm_c);
-            mm_r = temp_r;
-            mm_c = temp_c;
-        }
-
-        buf.*[i_m] = mm_r;
-        buf.*[i_m + 1] = mm_c;
-        i_m += 2;
-
-        var prev2_r: f32 = 0.0;
-        var prev2_c: f32 = 0.0;
-        var prev1_r: f32 = mm_r;
-        var prev1_c: f32 = mm_c;
-
-        for (@range(i16, m + 1, P2 + 1, 1)) |l| {
-            const a: f32 = @as(f32, 2 * l - 1) * dz;
-            const b: f32 = @as(f32, (l - 1) * (l - 1) - m * m);
-            const current_r: f32 = (a * prev1_r - b * prev2_r) * inv_r2;
-            const current_c: f32 = (a * prev1_c - b * prev2_c) * inv_r2;
-
-            buf.*[i_m] = current_r;
-            buf.*[i_m + 1] = current_c;
-            i_m += 2;
-
-            prev2_r = prev1_r;
-            prev2_c = prev1_c;
-            prev1_r = current_r;
-            prev1_c = current_c;
-        }
-    }
-}
-
-
 // --- M2M Translation (PACKED SIGNS) ---
 //
 // Pure function: translates a child multipole into its parent using the
@@ -223,85 +160,159 @@ fn translate(
 }
 
 
-// --- M2L without a table ---
+// --- M2L without a table, rectangular ---
 //
-//   L_j^p = (-1)^n sum_{n,k} M_n^k W_{n+j}^{p+k},  W^{-m} = (-1)^m conj(W^m),
-// with W = compute_irregular_harmonics_2p(-x, y, -z) of v = (x, y, z) = c_t - c_s,
-// which absorbs (-1)^j and the conjugate of the table form. For fixed (n, k, p),
-// L_j^p and W_{n+j}^{p+k} are contiguous over j = p..P with stride 2 (re or im), so
-// each of the four real products is one @fmacs. Operands zero by structure are
-// skipped (Im M_n^0, Im W^0, Im L_j^0). Same result as translate with the M2L table
-// up to f32 rounding (same terms, other order); the host checks it (compare_leaf).
-var m2l_row = @zeros([P + 1]u16);        // float index of (m, m), order P
-var m2l_row_2p = @zeros([2 * P + 1]u16); // same, order 2P
-var m2l_anchor = @zeros([2]f32);
+// L_j^p = (-1)^n sum_{n,k} M_n^k W_{n+j}^{p+k},  W^{-m} = (-1)^m conj(W^m),
+// with W the irregular harmonics of (-x, y, -z), v = (x, y, z) = c_t - c_s, which absorbs
+// (-1)^j and the conjugate of the table form. On flat arrays of row width R = 2P + 1, W at
+// (m + P) R + l and L at p R + j, for fixed (n, k) over q = p R + j:
+//   L[q] += (-1)^n M_n^k W[q + (k + P) R + n]
+// one contiguous @fmacs per real product. Slots j > P and j < p are written, never read; W
+// slots with l < |m| stay zero. Same result as the term-by-term sum up to f32 rounding
+// (testbench/kernels/kt2_*, worst element 4.7e-7 at P4).
+const M2L_R : u16 = 2 * P + 1;
+const M2L_R_I : i16 = @as(i16, M2L_R);
+const M2L_W_LEN : u16 = (3 * P + 1) * M2L_R;
+const M2L_L_LEN : u16 = P * M2L_R + P + 1;
+var m2l_wr = @zeros([M2L_W_LEN]f32);
+var m2l_wi = @zeros([M2L_W_LEN]f32);
+var m2l_lr = @zeros([M2L_L_LEN]f32);
+var m2l_li = @zeros([M2L_L_LEN]f32);
+var m2l_row = @zeros([P + 1]u16);       // float index of (m, m) in a target of order P
+var m2l_a1 = @zeros([1]f32);
+var m2l_a2 = @zeros([2]f32);
+const m2l_a1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_a1[ix] });
+const m2l_a2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_a2[2 * ix] });
+const m2l_lr_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{M2L_L_LEN} -> m2l_lr[ix] });
+const m2l_li_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{M2L_L_LEN} -> m2l_li[ix] });
+const m2l_wr_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{M2L_L_LEN} -> m2l_wr[ix] });
+const m2l_wi_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{M2L_L_LEN} -> m2l_wi[ix] });
 
 // Call once before the first translate_m2l.
 fn m2l_init() void {
     var a : u16 = 0;
-    var b : u16 = 0;
-    for (@range(u16, 2 * P + 1)) |m| {
-        if (m <= P) {
-            m2l_row[m] = a;
-            a += 2 * (P + 1 - m);
-        }
-        m2l_row_2p[m] = b;
-        b += 2 * (2 * P + 1 - m);
+    for (@range(u16, P + 1)) |m| {
+        m2l_row[m] = a;
+        a += 2 * (P + 1 - m);
     }
 }
 
-fn m2l_run(tgt: [*]f32, t: u16, w: [*]f32, v: u16, n: u16, s: f32) void {
-    var d = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_anchor[2 * ix] });
-    d = @set_dsd_base_addr(d, @ptrcast([*]f32, &tgt[t]));
-    d = @set_dsd_length(d, n);
-    var c = @get_dsd(mem1d_dsd, .{ .tensor_access = |ix|{1} -> m2l_anchor[2 * ix] });
-    c = @set_dsd_base_addr(c, @ptrcast([*]f32, &w[v]));
-    c = @set_dsd_length(c, n);
-    @fmacs(d, d, c, s);
+// Rows m >= 0 of W. Same recurrence as fmm_ref.compute_irregular_harmonics_2p.
+fn m2l_harmonics(dx: f32, dy: f32, dz: f32) void {
+    const r2 : f32 = dx * dx + dy * dy + dz * dz;
+    const inv_r2 : f32 = 1.0 / r2;
+    var mm_r : f32 = 1.0 / math.sqrt(r2);
+    var mm_c : f32 = 0.0;
+    const P2 : i16 = 2 * @as(i16, P);
+    var row : u16 = P * M2L_R;
+    for (@range(i16, P2 + 1)) |m| {
+        if (m > 0) {
+            const k_diag : f32 = @as(f32, -(2 * m - 1)) * inv_r2;
+            const temp_r : f32 = k_diag * (dx * mm_r - dy * mm_c);
+            const temp_c : f32 = k_diag * (dy * mm_r + dx * mm_c);
+            mm_r = temp_r;
+            mm_c = temp_c;
+        }
+        var at : u16 = row + @as(u16, m);
+        m2l_wr[at] = mm_r;
+        m2l_wi[at] = mm_c;
+        at += 1;
+        var prev2_r : f32 = 0.0;
+        var prev2_c : f32 = 0.0;
+        var prev1_r : f32 = mm_r;
+        var prev1_c : f32 = mm_c;
+        for (@range(i16, m + 1, P2 + 1, 1)) |l| {
+            const a : f32 = @as(f32, 2 * l - 1) * dz;
+            const b : f32 = @as(f32, (l - 1) * (l - 1) - m * m);
+            const cur_r : f32 = (a * prev1_r - b * prev2_r) * inv_r2;
+            const cur_c : f32 = (a * prev1_c - b * prev2_c) * inv_r2;
+            m2l_wr[at] = cur_r;
+            m2l_wi[at] = cur_c;
+            at += 1;
+            prev2_r = prev1_r;
+            prev2_c = prev1_c;
+            prev1_r = cur_r;
+            prev1_c = cur_c;
+        }
+        row += M2L_R;
+    }
 }
 
-// Accumulates (+=) into tgt. w: harmonics as above; src: the source expansion.
-fn translate_m2l(w: [*]f32, src: [*]f32, tgt: [*]f32) void {
+// Rows m < 0 from rows m > 0.
+fn m2l_negative_rows() void {
+    for (@range(u16, 1, P + 1, 1)) |m| {
+        const len : u16 = 2 * P + 1 - m;
+        const from : u16 = (m + P) * M2L_R + m;
+        const to : u16 = (P - m) * M2L_R + m;
+        var fr = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_wr[from]));
+        fr = @set_dsd_length(fr, len);
+        var fi = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_wi[from]));
+        fi = @set_dsd_length(fi, len);
+        var tr = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_wr[to]));
+        tr = @set_dsd_length(tr, len);
+        var ti = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_wi[to]));
+        ti = @set_dsd_length(ti, len);
+        if ((m & 1) == 1) {
+            @fnegs(tr, fr);
+            @fmovs(ti, fi);
+        } else {
+            @fmovs(tr, fr);
+            @fnegs(ti, fi);
+        }
+    }
+}
+
+// Accumulates (+=) into tgt. (dx, dy, dz) = (-x, y, -z) of v; src: the source expansion.
+fn translate_m2l(dx: f32, dy: f32, dz: f32, src: [*]f32, tgt: [*]f32) void {
+    m2l_harmonics(dx, dy, dz);
+    m2l_negative_rows();
+    @fmovs(m2l_lr_dsd, 0.0);
+    @fmovs(m2l_li_dsd, 0.0);
     for (@range(u16, P + 1)) |n| {
         const s0 : f32 = if ((n & 1) == 1) -1.0 else 1.0;
         const ni : i16 = @as(i16, n);
+        var off : i16 = @as(i16, (P - n) * M2L_R + n);
         var k : i16 = -ni;
         while (k <= ni) {
             const ak : u16 = @as(u16, if (k < 0) -k else k);
             const a_i : u16 = m2l_row[ak] + 2 * (n - ak);
-            const a : f32 = src[a_i];
-            const b : f32 = src[a_i + 1];
-            const k_odd : bool = (ak & 1) == 1;
-            for (@range(u16, P + 1)) |q| {
-                const m : i16 = @as(i16, q) + k;
-                const am : u16 = @as(u16, if (m < 0) -m else m);
-                const len : u16 = P + 1 - q;
-                const t_r : u16 = m2l_row[q];
-                const t_i : u16 = t_r + 1;
-                const c_v : u16 = m2l_row_2p[am] + 2 * (n + q - am);
-                const d_v : u16 = c_v + 1;
-                // (a + ib)(c + id) with the conjugates of k < 0 and m < 0
-                var s : f32 = s0;
-                var sb : f32 = -1.0;     // sign of b d in Re
-                var sd : f32 = 1.0;      // sign of a d in Im
-                var si : f32 = 1.0;      // sign of b c in Im
-                if (k < 0) {
-                    if (k_odd) s = -s;
-                    if (m >= 0) {
-                        sb = 1.0; si = -1.0;
-                    } else {
-                        if ((am & 1) == 1) s = -s;
-                        sd = -1.0; si = -1.0;
-                    }
-                }
-                m2l_run(tgt, t_r, w, c_v, len, s * a);
-                if (k != 0 and m != 0) m2l_run(tgt, t_r, w, d_v, len, s * sb * b);
-                if (q != 0) {
-                    if (m != 0) m2l_run(tgt, t_i, w, d_v, len, s * sd * a);
-                    if (k != 0) m2l_run(tgt, t_i, w, c_v, len, s * si * b);
-                }
+            var s : f32 = s0;
+            if (k < 0 and (ak & 1) == 1) {
+                s = -s;
             }
+            const a : f32 = s * src[a_i];
+            var b : f32 = s * src[a_i + 1];
+            if (k < 0) {
+                b = -b;
+            }
+            const wr = @increment_dsd_offset(m2l_wr_dsd, off, f32);
+            const wi = @increment_dsd_offset(m2l_wi_dsd, off, f32);
+            @fmacs(m2l_lr_dsd, m2l_lr_dsd, wr, a);
+            @fmacs(m2l_li_dsd, m2l_li_dsd, wi, a);
+            if (k != 0) {
+                @fmacs(m2l_lr_dsd, m2l_lr_dsd, wi, -b);
+                @fmacs(m2l_li_dsd, m2l_li_dsd, wr, b);
+            }
+            off += M2L_R_I;
             k += 1;
+        }
+    }
+    // Into the interleaved triangular target; Im L^0 is zero by structure.
+    for (@range(u16, P + 1)) |p| {
+        const base : u16 = m2l_row[p];
+        const at : u16 = p * M2L_R + p;
+        const len : u16 = P + 1 - p;
+        var tr = @set_dsd_base_addr(m2l_a2_dsd, @ptrcast([*]f32, &tgt[base]));
+        tr = @set_dsd_length(tr, len);
+        var lr = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_lr[at]));
+        lr = @set_dsd_length(lr, len);
+        @fadds(tr, tr, lr);
+        if (p != 0) {
+            var ti = @set_dsd_base_addr(m2l_a2_dsd, @ptrcast([*]f32, &tgt[base + 1]));
+            ti = @set_dsd_length(ti, len);
+            var li = @set_dsd_base_addr(m2l_a1_dsd, @ptrcast([*]f32, &m2l_li[at]));
+            li = @set_dsd_length(li, len);
+            @fadds(ti, ti, li);
         }
     }
 }

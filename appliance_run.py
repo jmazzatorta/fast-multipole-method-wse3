@@ -678,19 +678,22 @@ def main():
         assert bodies.ndim == 2 and bodies.shape[1] == 4, "--bodies: (N, 4) x, y, z, q"
         if s_phys is not None:
             bodies[:, :3] /= s_phys
-        assert bodies[:, :3].min() >= 0.0 and bodies[:, :3].max() < 512.0, \
-            "--bodies outside the domain [0, C * cell size)"
+        # 512.0 is allowed: an f32 position drawn below 512 can round to it, and
+        # cell_of puts it in the last cell, as for generated bodies.
+        assert bodies[:, :3].min() >= 0.0 and bodies[:, :3].max() <= 512.0, \
+            "--bodies outside the domain [0, C * cell size]"
         bodies = bodies.astype(np.float32)
     else:
         # Random bodies in the domain (prob_range=512); re-draw any body whose
-        # cell is already full (max_bodies_pe per cell).
+        # cell is already full (max_bodies_pe per cell). The cell is taken from
+        # the f32 position, as in build_bodies_tensor: from the f64 one, a body on
+        # a cell boundary could round into a full cell.
         rng = np.random.default_rng(args.seed)
-        cell = 512.0 / C
         fill = {}
         rows = []
         while len(rows) < args.nbodies:
-            p = rng.uniform(0.0, 512.0, 3)
-            key = tuple(min(int(v / cell), C - 1) for v in p)
+            p = rng.uniform(0.0, 512.0, 3).astype(np.float32)
+            key = cell_of(p, C)
             if fill.get(key, 0) >= max_bodies_pe:
                 continue
             fill[key] = fill.get(key, 0) + 1

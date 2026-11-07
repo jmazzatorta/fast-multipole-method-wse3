@@ -63,8 +63,6 @@ const N_COARSE : u16 = (ZP - (@as(u16, 1) << (LZP - ZA))) + (TREE_H - 2 - ZA);
 const P : u16 = order_p;
 const N_COEFFS : u16 = (P + 1) * (P + 2) / 2;          // 15 at P=4
 const C_BUF_SIZE : u16 = N_COEFFS * 2;                 // 30 at P=4 (interleaved re/im)
-const N_COEFFS_V : u16 = (2*P + 1) * (2*P + 2) / 2;    // 45 at P=4
-const C_BUF_M2L_SIZE : u16 = N_COEFFS_V * 2;           // 90 at P=4
 
 // --- Operator table sizes (P=4: M2M 92, L2L 105; M2L has no table) ---
 const M2M_N_ENTRIES : u16 = m2m_n_entries;

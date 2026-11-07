@@ -174,10 +174,9 @@ var l_coarse = @zeros([N_COARSE * cons.C_BUF_SIZE]f32);
 // SCRATCH  (fixed, recycled per translation; does NOT grow with C)
 // ===========================================================================
 // contrib_buf: solid harmonics of one body (used by P2M).
-// v_buf / v_buf_m2l: translation-vector harmonics (used by M2M/L2L and M2L).
+// v_buf: translation-vector harmonics (used by M2M/L2L).
 var contrib_buf = @zeros([cons.C_BUF_SIZE]f32);
 var v_buf = @zeros([cons.C_BUF_SIZE]f32);
-var v_buf_m2l = @zeros([cons.C_BUF_M2L_SIZE]f32);
 
 // ===========================================================================
 // RESULTS  (per body in the column: fx, fy, fz, pot)
@@ -266,9 +265,8 @@ fn m2l_pair(level: u16, dxp: i16, dyp: i16, mxy: i16, src_z: u16, tn: u16,
     var dist_x : f32 = 0.0; var dist_y : f32 = 0.0; var dist_z : f32 = 0.0;
     geom.get_physical_distances(dxp, dyp, dz, cons.box_size_at_level(level),
                                 &dist_x, &dist_y, &dist_z);
-    kernels.compute_irregular_harmonics_2p(-dist_x, dist_y, -dist_z, &v_buf_m2l);
     kernels.translate_m2l(
-        @ptrcast([*]f32, &v_buf_m2l[0]),
+        -dist_x, dist_y, -dist_z,
         src_exp,
         @ptrcast([*]f32, &l_target.*[tn * cons.C_BUF_SIZE]));
     return true;

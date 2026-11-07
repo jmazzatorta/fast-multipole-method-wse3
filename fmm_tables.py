@@ -104,7 +104,7 @@ def _src_signs(k):
 
 def gen_m2l_tables():
     """M2L for v_buf = IRREGULAR solid harmonics I(v) of order 2P
-    (kernels.csl compute_irregular_harmonics_2p), v = c_target - c_source:
+    (same harmonics as kernels.csl translate_m2l), v = c_target - c_source:
         L_j^p = (-1)^j sum_{n,k} M_n^k conj(I_{n+j}^{p+k}(v))
     in the normalisation of the device recurrences (see fmm_ref.py).
     N_COEFFS * (P+1)^2 entries (375 for P = 4). Validated end to end against
